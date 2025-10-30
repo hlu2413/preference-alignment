@@ -1,17 +1,27 @@
-import jax
-import jax.numpy as jnp
+import numpy as np
+import torch
 import matplotlib.pyplot as plt
 import numpy as np
 from typing import Dict, List, Callable
 from base import baseline_score_function
 
+def _params_device(params: Dict) -> torch.device:
+    for v in params.values():
+        if isinstance(v, dict):
+            d = _params_device(v)
+            if d is not None:
+                return d
+        elif torch.is_tensor(v):
+            return v.device
+    return torch.device('cpu')
+
 def visualize_multi_user_step(
     step: int,
-    particles: jnp.ndarray,
-    weights: jnp.ndarray,
-    observed_particles: jnp.ndarray,
-    observed_rewards: jnp.ndarray,
-    success_rates_per_user_history: List[jnp.ndarray],
+    particles: np.ndarray,
+    weights: np.ndarray,
+    observed_particles: np.ndarray,
+    observed_rewards: np.ndarray,
+    success_rates_per_user_history: List[np.ndarray],
     success_rates_overall_history: List[float],
     network: Dict,
     network_params: Dict,
@@ -27,17 +37,20 @@ def visualize_multi_user_step(
     fig, axes = plt.subplots(2, n_users + 1, figsize=(6 * (n_users + 1), 12))
     
     # Create grid for landscapes
-    x_grid = jnp.linspace(0, 1, 100)
-    y_grid = jnp.linspace(0, 1, 100)
-    X, Y = jnp.meshgrid(x_grid, y_grid)
-    grid_points = jnp.stack([X.ravel(), Y.ravel()], axis=1)
+    x_grid = np.linspace(0, 1, 100)
+    y_grid = np.linspace(0, 1, 100)
+    X, Y = np.meshgrid(x_grid, y_grid)
+    grid_points = np.stack([X.ravel(), Y.ravel()], axis=1)
     
     # Get learned rewards for all users
-    learned_rewards_all = network['forward'](network_params, grid_points)
+    dev = _params_device(network_params)
+    grid_points_t = torch.tensor(grid_points, dtype=torch.float32, device=dev)
+    learned_rewards_all_t = network['forward'](network_params, grid_points_t)
+    learned_rewards_all = learned_rewards_all_t.detach().cpu().numpy()
     
     # Get actual rewards for all users
-    actual_rewards_all = jnp.stack([
-        true_reward_fns[i](grid_points) for i in range(n_users)
+    actual_rewards_all = np.stack([
+        true_reward_fns[i](torch.tensor(grid_points, dtype=torch.float32, device=dev)).detach().cpu().numpy() for i in range(n_users)
     ], axis=1)
     
     # Row 1: Learned Rewards
@@ -50,7 +63,7 @@ def visualize_multi_user_step(
         plt.colorbar(im1, ax=ax, label='Learned Reward', shrink=0.8)
         
         # Plot all particles colored by weight
-        valid_mask = ~jnp.isnan(particles).any(axis=1)
+        valid_mask = ~np.isnan(particles).any(axis=1)
         valid_particles = particles[valid_mask]
         valid_weights = weights[valid_mask]
         
@@ -58,7 +71,7 @@ def visualize_multi_user_step(
             scatter1 = ax.scatter(
                 valid_particles[:, 0], valid_particles[:, 1],
                 c=valid_weights, cmap='plasma', s=30, alpha=0.6,
-                vmin=jnp.min(valid_weights), vmax=jnp.max(valid_weights)
+                vmin=np.min(valid_weights), vmax=np.max(valid_weights)
             )
             plt.colorbar(scatter1, ax=ax, label='Weight', shrink=0.8, pad=0.1)
         
@@ -78,7 +91,7 @@ def visualize_multi_user_step(
     
     # Combined learned (average across users - concatenated view)
     ax = axes[0, n_users]
-    combined_learned = jnp.mean(learned_rewards_all, axis=1).reshape(X.shape)
+    combined_learned = np.mean(learned_rewards_all, axis=1).reshape(X.shape)
     im = ax.contourf(X, Y, combined_learned, levels=20, cmap='viridis', alpha=0.4)
     plt.colorbar(im, ax=ax, label='Avg Learned Reward', shrink=0.8)
     
@@ -86,7 +99,7 @@ def visualize_multi_user_step(
         scatter = ax.scatter(
             valid_particles[:, 0], valid_particles[:, 1],
             c=valid_weights, cmap='plasma', s=30, alpha=0.6,
-            vmin=jnp.min(valid_weights), vmax=jnp.max(valid_weights)
+            vmin=np.min(valid_weights), vmax=np.max(valid_weights)
         )
         plt.colorbar(scatter, ax=ax, label='Weight', shrink=0.8, pad=0.1)
     
@@ -131,13 +144,13 @@ def visualize_multi_user_step(
     
     # Combined actual (average across users - concatenated view)
     ax = axes[1, n_users]
-    combined_actual = jnp.mean(actual_rewards_all, axis=1).reshape(X.shape)
+    combined_actual = np.mean(actual_rewards_all, axis=1).reshape(X.shape)
     im = ax.contourf(X, Y, combined_actual, levels=20, cmap='viridis', alpha=0.6)
     plt.colorbar(im, ax=ax, label='Avg Actual Reward', shrink=0.8)
     
     # Color by average reward across all users
     if len(observed_particles) > 0:
-        avg_obs_rewards = jnp.mean(observed_rewards, axis=1)
+        avg_obs_rewards = np.mean(observed_rewards, axis=1)
         scatter = ax.scatter(
             observed_particles[:, 0], observed_particles[:, 1],
             c=avg_obs_rewards, cmap='RdYlGn', s=100, alpha=0.9,
@@ -161,15 +174,15 @@ def visualize_multi_user_step(
     print(f"    Per-user success rates: {success_rates_per_user_history[-1]}")
     print(f"    Overall success rate: {success_rates_overall_history[-1]:.3f}")
     if len(observed_particles) > 0:
-        mean_rewards = jnp.mean(observed_rewards, axis=0)
+        mean_rewards = np.mean(observed_rewards, axis=0)
         print(f"    Mean rewards per user: {mean_rewards}")
 
 
 def visualize_multi_user_gamma_and_success(
     gamma_history: List[float],
-    success_rates_per_user_history: List[jnp.ndarray],
+    success_rates_per_user_history: List[np.ndarray],
     success_rates_overall_history: List[float],
-    all_weights: List[jnp.ndarray],
+    all_weights: List[np.ndarray],
     k_observe: int,
     n_users: int
 ):
@@ -217,7 +230,10 @@ def visualize_multi_user_gamma_and_success(
     axes[1, 0].set_ylim(0, 1)
     
     # Plot 4: Weight distribution evolution (box plot)
-    weight_data = [w for w in all_weights[1:]]  # Skip cold start
+    weight_data = [
+        (w.detach().cpu().numpy() if torch.is_tensor(w) else np.asarray(w))
+        for w in all_weights[1:]
+    ]  # Skip cold start
     if len(weight_data) > 0:
         axes[1, 1].boxplot(weight_data, positions=steps)
         axes[1, 1].set_title('Weight Distribution Evolution', fontsize=14, fontweight='bold')
@@ -240,7 +256,7 @@ def visualize_multi_user_gamma_and_success(
 
 
 def visualize_multi_user_final_results(
-    success_rates_per_user_history: List[jnp.ndarray],
+    success_rates_per_user_history: List[np.ndarray],
     success_rates_overall_history: List[float],
     gamma_history: List[float],
     n_users: int

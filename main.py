@@ -2,16 +2,32 @@
 Main FKC diffusion algorithm with budget constraints.
 """
 
-import jax
-import jax.numpy as jnp
-import jax.random as random
-import optax
+import torch
 from typing import Tuple, Dict, List
 from reward import create_four_optima_reward_landscape, four_optima_reward_gradient
 from base import baseline_sde_step
 from fkc import gamma_schedule, run_fkc_simulation
 from nn import create_cnn_reward_network, update_network, reward_network_gradient
 from visualization import visualize_base_model_distribution, visualize_step, visualize_gamma_and_diversity
+
+def _sub_generator(generator: torch.Generator | None) -> torch.Generator | None:
+    if generator is None:
+        return None
+    device = getattr(generator, "device", "cpu")
+    new_gen = torch.Generator(device=device)
+    seed_tensor = torch.randint(0, 2**31 - 1, (1,), device=device, generator=generator)
+    new_gen.manual_seed(int(seed_tensor.item()))
+    return new_gen
+
+def _collect_param_tensors(params):
+    tensors = []
+    for v in params.values():
+        if isinstance(v, dict):
+            tensors.extend(_collect_param_tensors(v))
+        else:
+            if torch.is_tensor(v):
+                tensors.append(v)
+    return tensors
 
 def budget_constrained_diffusion(k_observe: int, B: int, 
                                 n_particles: int = 200,
@@ -30,20 +46,26 @@ def budget_constrained_diffusion(k_observe: int, B: int,
         raise ValueError("k_observe must be <= n_particles")
     
     # Initialize
-    key = random.PRNGKey(42)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    generator = torch.Generator(device=device)
+    generator.manual_seed(42)
     
     # Network setup
     if network is None:
         network = create_cnn_reward_network()
-        key, subkey = random.split(key)
-        network_params = network['init'](subkey)
-        optimizer = optax.adam(learning_rate=0.01)
-        opt_state = optimizer.init(network_params)
+        sub_gen = _sub_generator(generator)
+        network_params = network['init'](sub_gen)
+        # move params to device
+        for t in _collect_param_tensors(network_params):
+            t.data = t.data.to(device)
+            t.requires_grad_(True)
+        optimizer = torch.optim.Adam(_collect_param_tensors(network_params), lr=0.01)
+        opt_state = None
         print("  Created new neural network")
     else:
-        optimizer = optax.adam(learning_rate=0.01)
         if opt_state is None:
-            opt_state = optimizer.init(network_params)
+            optimizer = torch.optim.Adam(_collect_param_tensors(network_params), lr=0.01)
+            opt_state = None
         print("  Using pre-trained neural network (continuing training)")
     
     # Storage for results
@@ -70,16 +92,16 @@ def budget_constrained_diffusion(k_observe: int, B: int,
     # === COLD START (Step 0) ===
     print(f"Step {step_count} [COLD START], Budget remaining: {B}")
     
-    key, subkey = random.split(key)
-    particles = random.uniform(subkey, (k_observe, 2))
+    sub_gen = _sub_generator(generator)
+    particles = torch.rand((k_observe, 2), generator=sub_gen, device=device)
     
     dt = -1.0 / n_steps
     for i in range(n_steps):
         t = 1.0 + i * dt
-        key, subkey = random.split(key)
-        particles = baseline_sde_step(particles, t, dt, subkey)
+        sub_gen = _sub_generator(generator)
+        particles = baseline_sde_step(particles, t, dt, sub_gen)
     
-    particles = jnp.clip(particles, 0, 1)
+    particles = torch.clamp(particles, 0, 1)
     observed_particles = particles
     observed_rewards = reward_fn(observed_particles)
     
@@ -88,8 +110,8 @@ def budget_constrained_diffusion(k_observe: int, B: int,
     historical_rewards_list.append(observed_rewards)
     
     # Train on all historical data (just this batch for now)
-    all_historical_particles = jnp.concatenate(historical_particles_list, axis=0)
-    all_historical_rewards = jnp.concatenate(historical_rewards_list, axis=0)
+    all_historical_particles = torch.cat(historical_particles_list, dim=0)
+    all_historical_rewards = torch.cat(historical_rewards_list, dim=0)
     
     print(f"  Training CNN on {len(all_historical_particles)} observations")
     for epoch in range(50):
@@ -99,19 +121,26 @@ def budget_constrained_diffusion(k_observe: int, B: int,
         )
     print(f"    Loss: {loss:.4f}")
     
-    success_rate = jnp.mean((observed_rewards > 0.7).astype(float))
-    success_rates.append(success_rate)
+    success_rate = torch.mean((observed_rewards > 0.7).float())
+    success_rates.append(float(success_rate.item()))
     
     all_particles.append(particles)
-    all_weights.append(jnp.ones(len(particles)))
+    all_weights.append(torch.ones(len(particles), device=device))
     all_observed_particles.append(observed_particles)
     all_observed_rewards.append(observed_rewards)
     
     B -= k_observe
     step_count += 1
     
-    visualize_step(step_count, particles, jnp.ones(len(particles)), observed_particles, 
-                  observed_rewards, success_rates, network, network_params, reward_fn)
+    visualize_step(
+        step_count,
+        particles.detach().cpu().numpy(),
+        torch.ones(len(particles)).detach().cpu().numpy(),
+        observed_particles.detach().cpu().numpy(),
+        observed_rewards.detach().cpu().numpy(),
+        [float(s.item()) if torch.is_tensor(s) else float(s) for s in success_rates],
+        network, network_params, reward_fn
+    )
     
     # === MAIN LOOP (Step 1 onwards) ===
     while B > 0:
@@ -120,9 +149,9 @@ def budget_constrained_diffusion(k_observe: int, B: int,
         # NEW: Check for neural network convergence
         if diversity_enabled and len(historical_particles_list) > 0:
             # Randomly sample particles from previous step
-            key, subkey = random.split(key)
-            check_indices = random.choice(subkey, len(historical_particles_list[-1]), 
-                                       (convergence_check_particles,), replace=False)
+            sub_gen = _sub_generator(generator)
+            perm = torch.randperm(len(historical_particles_list[-1]), generator=sub_gen, device=device)
+            check_indices = perm[:convergence_check_particles]
             check_particles = historical_particles_list[-1][check_indices]
             
             # Get old and new reward estimates
@@ -130,8 +159,8 @@ def budget_constrained_diffusion(k_observe: int, B: int,
             new_rewards = network['forward'](network_params, check_particles)
             
             # Check convergence
-            reward_change = jnp.mean(jnp.abs(new_rewards - old_rewards))
-            print(f"  Convergence check: {reward_change:.4f}")
+            reward_change = torch.mean(torch.abs(new_rewards - old_rewards))
+            print(f"  Convergence check: {float(reward_change):.4f}")
             
             if reward_change < convergence_threshold:
                 diversity_enabled = False
@@ -142,13 +171,13 @@ def budget_constrained_diffusion(k_observe: int, B: int,
         print(f"  Gamma: {current_gamma:.3f} | Diversity: {diversity_enabled}")
         
         # Concatenate all historical particles (for diversity)
-        historical_particles = jnp.concatenate(historical_particles_list, axis=0)
+        historical_particles = torch.cat(historical_particles_list, dim=0)
         print(f"  Historical particles: {len(historical_particles)}")
         
         # Generate particles
-        key, subkey = random.split(key)
-        particles = random.uniform(subkey, (n_particles, 2))
-        weights = jnp.zeros(n_particles)
+        sub_gen = _sub_generator(generator)
+        particles = torch.rand((n_particles, 2), generator=sub_gen, device=device)
+        weights = torch.zeros(n_particles, device=device)
         
         def reward_grad_fn(x):
             return reward_network_gradient(network, network_params, x)
@@ -160,7 +189,7 @@ def budget_constrained_diffusion(k_observe: int, B: int,
             beta_t=1.0,
             gamma_t=current_gamma,
             n_steps=n_steps,
-            key=subkey,
+            generator=sub_gen,
             network=network,
             network_params=network_params,
             historical_particles=historical_particles,
@@ -171,11 +200,11 @@ def budget_constrained_diffusion(k_observe: int, B: int,
         gamma_history.append(current_gamma)
         
         # Selection
-        sorted_indices = jnp.argsort(weights)
+        sorted_indices = torch.argsort(weights)
         observe_indices = sorted_indices[-k_observe:]
         
         selected_weights = weights[observe_indices]
-        print(f"    Weight range: [{jnp.min(weights):.2f}, {jnp.max(weights):.2f}] | Selected: [{jnp.min(selected_weights):.2f}, {jnp.max(selected_weights):.2f}]")
+        print(f"    Weight range: [{float(torch.min(weights)):.2f}, {float(torch.max(weights)):.2f}] | Selected: [{float(torch.min(selected_weights)):.2f}, {float(torch.max(selected_weights)):.2f}]")
         
         # Observe true rewards
         observed_particles = particles[observe_indices]
@@ -185,12 +214,12 @@ def budget_constrained_diffusion(k_observe: int, B: int,
         historical_particles_list.append(observed_particles)
         historical_rewards_list.append(observed_rewards)
         
-        success_rate = jnp.mean((observed_rewards > 0.7).astype(float))
-        success_rates.append(success_rate)
+        success_rate = torch.mean((observed_rewards > 0.7).float())
+        success_rates.append(float(success_rate.item()))
         
         # CRITICAL FIX: Train on ALL historical observations, not just current batch
-        all_historical_particles = jnp.concatenate(historical_particles_list, axis=0)
-        all_historical_rewards = jnp.concatenate(historical_rewards_list, axis=0)
+        all_historical_particles = torch.cat(historical_particles_list, dim=0)
+        all_historical_rewards = torch.cat(historical_rewards_list, dim=0)
         
         print(f"  Training CNN on {len(all_historical_particles)} observations...")
         for epoch in range(50):
@@ -212,8 +241,15 @@ def budget_constrained_diffusion(k_observe: int, B: int,
         step_count += 1
         
         # Visualize
-        visualize_step(step_count, particles, weights, observed_particles, 
-                      observed_rewards, success_rates, network, network_params, reward_fn)
+        visualize_step(
+            step_count,
+            particles.detach().cpu().numpy(),
+            weights.detach().cpu().numpy(),
+            observed_particles.detach().cpu().numpy(),
+            observed_rewards.detach().cpu().numpy(),
+            [float(s.item()) if torch.is_tensor(s) else float(s) for s in success_rates],
+            network, network_params, reward_fn
+        )
     
     # Return results
     return (all_particles, all_weights, all_observed_particles, all_observed_rewards, 

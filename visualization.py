@@ -2,12 +2,21 @@
 Visualization functions for FKC diffusion algorithm.
 """
 
-import jax
-import jax.numpy as jnp
-import matplotlib.pyplot as plt
 import numpy as np
+import torch
+import matplotlib.pyplot as plt
 from typing import Dict
 from base import baseline_score_function
+
+def _params_device(params: Dict) -> torch.device:
+    for v in params.values():
+        if isinstance(v, dict):
+            d = _params_device(v)
+            if d is not None:
+                return d
+        elif torch.is_tensor(v):
+            return v.device
+    return torch.device('cpu')
 
 def visualize_base_model_distribution():
     """
@@ -17,19 +26,19 @@ def visualize_base_model_distribution():
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(24, 7))
     
     # Create grid
-    x_grid = jnp.linspace(0, 1, 200)
-    y_grid = jnp.linspace(0, 1, 200)
-    X, Y = jnp.meshgrid(x_grid, y_grid)
-    grid_points = jnp.stack([X.ravel(), Y.ravel()], axis=1)
+    x_grid = np.linspace(0, 1, 200)
+    y_grid = np.linspace(0, 1, 200)
+    X, Y = np.meshgrid(x_grid, y_grid)
+    grid_points = np.stack([X.ravel(), Y.ravel()], axis=1)
     
     # === LEFT PLOT: Base Model Distribution ===
-    mean = jnp.array([0.5, 0.5])
+    mean = np.array([0.5, 0.5])
     sigma = 0.15
     
     # Compute probability density
-    distances_sq = jnp.sum((grid_points - mean[None, :])**2, axis=1)
+    distances_sq = np.sum((grid_points - mean[None, :])**2, axis=1)
     log_prob = -distances_sq / (2 * sigma**2)
-    prob = jnp.exp(log_prob)
+    prob = np.exp(log_prob)
     prob = prob.reshape(X.shape)
     
     # Plot base model with better colormap
@@ -56,13 +65,13 @@ def visualize_base_model_distribution():
     # === RIGHT PLOT: Reward Function ===
     # Compute reward function
     reward_peaks = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)]
-    reward_values = jnp.zeros_like(X)
+    reward_values = np.zeros_like(X)
     
     for peak_x, peak_y in reward_peaks:
-        dist = jnp.sqrt((X - peak_x)**2 + (Y - peak_y)**2)
-        reward_values += jnp.exp(-dist**2 / 0.05)
+        dist = np.sqrt((X - peak_x)**2 + (Y - peak_y)**2)
+        reward_values += np.exp(-dist**2 / 0.05)
     
-    reward_values = jnp.clip(reward_values, 0, 1)
+    reward_values = np.clip(reward_values, 0, 1)
     
     # Plot reward function with better colormap
     im2 = ax2.contourf(X, Y, reward_values, levels=50, cmap='plasma', alpha=0.9)
@@ -89,13 +98,13 @@ def visualize_base_model_distribution():
     # === THIRD PLOT: Three-Mode Reward Function ===
     # Compute three-mode reward function
     three_mode_peaks = [(0.25, 0.25), (0.5, 0.5), (0.75, 0.75)]
-    three_mode_values = jnp.zeros_like(X)
+    three_mode_values = np.zeros_like(X)
     
     for peak_x, peak_y in three_mode_peaks:
-        dist = jnp.sqrt((X - peak_x)**2 + (Y - peak_y)**2)
-        three_mode_values += jnp.exp(-dist**2 / 0.03)
+        dist = np.sqrt((X - peak_x)**2 + (Y - peak_y)**2)
+        three_mode_values += np.exp(-dist**2 / 0.03)
     
-    three_mode_values = jnp.clip(three_mode_values, 0, 1)
+    three_mode_values = np.clip(three_mode_values, 0, 1)
     
     # Plot three-mode reward function
     im3 = ax3.contourf(X, Y, three_mode_values, levels=50, cmap='plasma', alpha=0.9)
@@ -139,8 +148,14 @@ def visualize_base_model_distribution():
     print("="*60)
 
 
-def visualize_step(step: int, particles: jnp.ndarray, weights: jnp.ndarray, 
-                  observed_particles: jnp.ndarray, observed_rewards: jnp.ndarray,
+def _to_float_list(seq):
+    return [
+        (x.detach().cpu().item() if hasattr(x, "detach") else float(x))
+        for x in seq
+    ]
+
+def visualize_step(step: int, particles: np.ndarray, weights: np.ndarray, 
+                  observed_particles: np.ndarray, observed_rewards: np.ndarray,
                   success_rates: list, network: Dict, network_params: Dict,
                   reward_fn):
     """
@@ -153,22 +168,24 @@ def visualize_step(step: int, particles: jnp.ndarray, weights: jnp.ndarray,
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     
     # Create grid for landscape visualization
-    x_grid = jnp.linspace(0, 1, 100)
-    y_grid = jnp.linspace(0, 1, 100)
-    X, Y = jnp.meshgrid(x_grid, y_grid)
-    grid_points = jnp.stack([X.ravel(), Y.ravel()], axis=1)
+    x_grid = np.linspace(0, 1, 100)
+    y_grid = np.linspace(0, 1, 100)
+    X, Y = np.meshgrid(x_grid, y_grid)
+    grid_points = np.stack([X.ravel(), Y.ravel()], axis=1)
     
     # === PLOT 1: CNN Learned Reward + All Particles (colored by weight) + Selected Particles (circled) ===
     # Get CNN learned rewards for grid
-    learned_rewards = network['forward'](network_params, grid_points)
-    learned_rewards = learned_rewards.reshape(X.shape)
+    dev = _params_device(network_params)
+    grid_points_t = torch.tensor(grid_points, dtype=torch.float32, device=dev)
+    learned_rewards_t = network['forward'](network_params, grid_points_t)
+    learned_rewards = learned_rewards_t.detach().cpu().numpy().reshape(X.shape)
     
     # Plot learned reward landscape
     im1 = axes[0].contourf(X, Y, learned_rewards, levels=20, cmap='viridis', alpha=0.4)
     plt.colorbar(im1, ax=axes[0], label='Learned Reward')
     
     # Plot all generated particles colored by their weights
-    valid_particles = ~jnp.isnan(particles).any(axis=1)
+    valid_particles = ~np.isnan(particles).any(axis=1)
     valid_weights = weights[valid_particles]
     valid_particles_coords = particles[valid_particles]
     
@@ -181,8 +198,8 @@ def visualize_step(step: int, particles: jnp.ndarray, weights: jnp.ndarray,
             cmap='plasma',  # Different colormap from landscape
             s=30, 
             alpha=0.6,
-            vmin=jnp.min(valid_weights),
-            vmax=jnp.max(valid_weights),
+            vmin=np.min(valid_weights),
+            vmax=np.max(valid_weights),
             edgecolors='none',
             label=f'All particles (n={len(valid_particles_coords)})'
         )
@@ -212,8 +229,8 @@ def visualize_step(step: int, particles: jnp.ndarray, weights: jnp.ndarray,
     
     # === PLOT 2: True Reward + Observed Particles (color by actual reward - continuous) ===
     # Get true rewards for grid
-    true_rewards = reward_fn(grid_points)
-    true_rewards = true_rewards.reshape(X.shape)
+    true_rewards_t = reward_fn(torch.tensor(grid_points, dtype=torch.float32, device=dev))
+    true_rewards = true_rewards_t.detach().cpu().numpy().reshape(X.shape)
     
     # Plot true reward landscape
     im2 = axes[1].contourf(X, Y, true_rewards, levels=20, cmap='viridis', alpha=0.6)
@@ -247,7 +264,8 @@ def visualize_step(step: int, particles: jnp.ndarray, weights: jnp.ndarray,
     axes[1].set_ylim(0, 1)
     
     # === PLOT 3: Success Rate Evolution ===
-    axes[2].plot(range(1, len(success_rates) + 1), success_rates, 'b-o', linewidth=2, markersize=6)
+    success_rates_f = _to_float_list(success_rates)
+    axes[2].plot(range(1, len(success_rates_f) + 1), success_rates_f, 'b-o', linewidth=2, markersize=6)
     axes[2].set_title('Success Rate Evolution')
     axes[2].set_xlabel('Step')
     axes[2].set_ylabel('Success Rate')
@@ -261,9 +279,10 @@ def visualize_step(step: int, particles: jnp.ndarray, weights: jnp.ndarray,
     
     # Print key statistics
     if len(observed_particles) > 0:
-        n_success = jnp.sum(observed_rewards > 0.7)
-        avg_reward = jnp.mean(observed_rewards)
-        print(f"Step {step}: {n_success}/{len(observed_particles)} success ({success_rates[-1]:.1%}) | Avg: {avg_reward:.3f}")
+        n_success = np.sum(observed_rewards > 0.7)
+        avg_reward = np.mean(observed_rewards)
+        last_rate = success_rates_f[-1]
+        print(f"Step {step}: {n_success}/{len(observed_particles)} success ({last_rate:.1%}) | Avg: {avg_reward:.3f}")
 
 
 def visualize_gamma_and_diversity(gamma_history, all_weights, k_observe):
@@ -283,7 +302,10 @@ def visualize_gamma_and_diversity(gamma_history, all_weights, k_observe):
     axes[0, 0].set_ylim(0, max(gamma_history) * 1.1 if max(gamma_history) > 0 else 0.1)
     
     # Plot 2: Weight distribution evolution (box plot)
-    weight_data = [w for w in all_weights[1:]]  # Skip cold start
+    weight_data = [
+        (w.detach().cpu().numpy() if torch.is_tensor(w) else np.asarray(w))
+        for w in all_weights[1:]
+    ]  # Skip cold start
     axes[0, 1].boxplot(weight_data, positions=steps)
     axes[0, 1].set_title('Weight Distribution Evolution', fontsize=14, fontweight='bold')
     axes[0, 1].set_xlabel('Step', fontsize=12)
@@ -291,8 +313,14 @@ def visualize_gamma_and_diversity(gamma_history, all_weights, k_observe):
     axes[0, 1].grid(True, alpha=0.3, axis='y')
     
     # Plot 3: Mean and std of weights over time
-    mean_weights = [jnp.mean(w) for w in all_weights[1:]]
-    std_weights = [jnp.std(w) for w in all_weights[1:]]
+    mean_weights = [
+        np.mean(w.detach().cpu().numpy() if torch.is_tensor(w) else np.asarray(w))
+        for w in all_weights[1:]
+    ]
+    std_weights = [
+        np.std(w.detach().cpu().numpy() if torch.is_tensor(w) else np.asarray(w))
+        for w in all_weights[1:]
+    ]
     
     axes[1, 0].plot(steps, mean_weights, 'o-', color='blue', linewidth=2, markersize=6, label='Mean')
     axes[1, 0].fill_between(steps, 
@@ -305,10 +333,15 @@ def visualize_gamma_and_diversity(gamma_history, all_weights, k_observe):
     axes[1, 0].legend()
     axes[1, 0].grid(True, alpha=0.3)
     
-    # Plot 4: REMOVED (was selection threshold)
-    # NEW: Weight range evolution (min/max)
-    min_weights = [jnp.min(w) for w in all_weights[1:]]
-    max_weights = [jnp.max(w) for w in all_weights[1:]]
+    # Plot 4: Weight range evolution (min/max)
+    min_weights = [
+        np.min(w.detach().cpu().numpy() if torch.is_tensor(w) else np.asarray(w))
+        for w in all_weights[1:]
+    ]
+    max_weights = [
+        np.max(w.detach().cpu().numpy() if torch.is_tensor(w) else np.asarray(w))
+        for w in all_weights[1:]
+    ]
     
     axes[1, 1].plot(steps, max_weights, 'o-', color='green', linewidth=2, markersize=6, label='Max Weight')
     axes[1, 1].plot(steps, min_weights, 'o-', color='red', linewidth=2, markersize=6, label='Min Weight')

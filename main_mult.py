@@ -2,10 +2,7 @@
 Multi-user reward learning with budget-constrained FKC diffusion.
 """
 
-import jax
-import jax.numpy as jnp
-import jax.random as random
-import optax
+import torch
 import matplotlib.pyplot as plt
 from typing import Tuple, Dict, List, Callable
 
@@ -30,6 +27,28 @@ from visuzalization_mult import (
     visualize_multi_user_gamma_and_success,
     visualize_multi_user_final_results
 )
+
+def _sub_generator(generator: torch.Generator | None) -> torch.Generator | None:
+    if generator is None:
+        return None
+    device = getattr(generator, "device", "cpu")
+    new_gen = torch.Generator(device=device)
+    seed_tensor = torch.randint(0, 2**31 - 1, (1,), device=device, generator=generator)
+    new_gen.manual_seed(int(seed_tensor.item()))
+    return new_gen
+
+def _collect_param_tensors(params):
+    tensors = []
+    for v in params.values():
+        if isinstance(v, dict):
+            tensors.extend(_collect_param_tensors(v))
+        elif isinstance(v, list):
+            for item in v:
+                tensors.extend(_collect_param_tensors(item) if isinstance(item, dict) else ([item] if torch.is_tensor(item) else []))
+        else:
+            if torch.is_tensor(v):
+                tensors.append(v)
+    return tensors
 
 def multi_user_budget_constrained_diffusion(
     k_observe: int,
@@ -73,7 +92,9 @@ def multi_user_budget_constrained_diffusion(
         raise ValueError("k_observe must be <= n_particles")
     
     # Initialize
-    key = random.PRNGKey(42)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    generator = torch.Generator(device=device)
+    generator.manual_seed(42)
     
     # Create multi-user network
     print("Initializing multi-user reward network...")
@@ -83,11 +104,14 @@ def multi_user_budget_constrained_diffusion(
         n_heads=n_heads,
         n_layers=n_layers
     )
-    key, subkey = random.split(key)
-    network_params = network['init'](subkey)
+    sub_gen = _sub_generator(generator)
+    network_params = network['init'](sub_gen)
+    for t in _collect_param_tensors(network_params):
+        t.data = t.data.to(device)
+        t.requires_grad_(True)
     
-    optimizer = optax.adam(learning_rate=learning_rate)
-    opt_state = optimizer.init(network_params)
+    optimizer = torch.optim.Adam(_collect_param_tensors(network_params), lr=learning_rate)
+    opt_state = None
     print(f"  Created network for {n_users} users")
     
     # Storage for results
@@ -105,7 +129,7 @@ def multi_user_budget_constrained_diffusion(
     
     # Diversity control
     diversity_enabled = True
-    user_convergence_status = jnp.zeros(n_users, dtype=bool)
+    user_convergence_status = torch.zeros(n_users, dtype=torch.bool, device=device)
     
     # Estimate total steps
     total_steps = B // k_observe
@@ -116,33 +140,34 @@ def multi_user_budget_constrained_diffusion(
     print(f"Step {step_count} [COLD START], Budget remaining: {B}")
     print(f"{'='*60}")
     
-    key, subkey = random.split(key)
-    particles = random.uniform(subkey, (k_observe, 2))
+    sub_gen = _sub_generator(generator)
+    particles = torch.rand((k_observe, 2), generator=sub_gen, device=device)
     
     # Run baseline diffusion
     dt = -1.0 / n_steps
     for i in range(n_steps):
         t = 1.0 + i * dt
-        key, subkey = random.split(key)
-        particles = baseline_sde_step(particles, t, dt, subkey)
+        sub_gen = _sub_generator(generator)
+        particles = baseline_sde_step(particles, t, dt, sub_gen)
     
-    particles = jnp.clip(particles, 0, 1)
+    particles = torch.clamp(particles, 0, 1)
     observed_particles = particles
     
-    # Observe rewards from all users
+    # Observe rewards from all users (no grad tracking)
     observed_rewards_list = []
-    for i in range(n_users):
-        rewards_i = true_reward_fns[i](observed_particles)
-        observed_rewards_list.append(rewards_i)
-    observed_rewards = jnp.stack(observed_rewards_list, axis=1)
+    with torch.no_grad():
+        for i in range(n_users):
+            rewards_i = true_reward_fns[i](observed_particles)
+            observed_rewards_list.append(rewards_i)
+        observed_rewards = torch.stack(observed_rewards_list, dim=1)
     
     # Add to historical data
     historical_particles_list.append(observed_particles)
     historical_rewards_list.append(observed_rewards)
     
     # Train on initial observations
-    all_historical_particles = jnp.concatenate(historical_particles_list, axis=0)
-    all_historical_rewards = jnp.concatenate(historical_rewards_list, axis=0)
+    all_historical_particles = torch.cat(historical_particles_list, dim=0)
+    all_historical_rewards = torch.cat(historical_rewards_list, dim=0)
     
     print(f"  Training network on {len(all_historical_particles)} observations")
     for epoch in range(50):
@@ -152,28 +177,39 @@ def multi_user_budget_constrained_diffusion(
         )
     print(f"    Final loss: {loss:.4f}")
     
-    # Calculate success rates
-    per_user_success = jnp.array([
-        jnp.mean((observed_rewards[:, i] > 0.7).astype(float))
-        for i in range(n_users)
-    ])
-    # Overall success: concatenate all user rewards and compute success rate
-    overall_success = jnp.mean((observed_rewards > 0.7).astype(float))
+    # Calculate success rates (no grad tracking)
+    with torch.no_grad():
+        per_user_success = torch.stack([
+            torch.mean((observed_rewards[:, i] > 0.7).float())
+            for i in range(n_users)
+        ])
+        # Overall success: concatenate all user rewards and compute success rate
+        overall_success = torch.mean((observed_rewards > 0.7).float())
     
     success_rates_per_user_history.append(per_user_success)
     success_rates_overall_history.append(float(overall_success))
     
     # Store results
     all_particles.append(particles)
-    all_weights.append(jnp.ones(len(particles)))
+    all_weights.append(torch.ones(len(particles), device=device))
     all_observed_particles.append(observed_particles)
     all_observed_rewards.append(observed_rewards)
     
     # Visualize
+    success_rates_per_user_history_py = [
+        [
+            (x.detach().cpu().item() if hasattr(x, 'detach') else float(x))
+            for x in step
+        ]
+        for step in success_rates_per_user_history
+    ]
     visualize_multi_user_step(
-        step_count, particles, jnp.ones(len(particles)),
-        observed_particles, observed_rewards,
-        success_rates_per_user_history, success_rates_overall_history,
+        step_count,
+        particles.detach().cpu().numpy(),
+        torch.ones(len(particles)).detach().cpu().numpy(),
+        observed_particles.detach().cpu().numpy(),
+        observed_rewards.detach().cpu().numpy(),
+        success_rates_per_user_history_py, success_rates_overall_history,
         network, network_params, true_reward_fns, n_users
     )
     
@@ -188,29 +224,28 @@ def multi_user_budget_constrained_diffusion(
         
         # Check convergence for each user
         if diversity_enabled and len(historical_particles_list) > 0:
-            key, subkey = random.split(key)
-            check_indices = random.choice(
-                subkey, len(historical_particles_list[-1]),
-                (convergence_check_particles,), replace=False
-            )
+            sub_gen = _sub_generator(generator)
+            perm = torch.randperm(len(historical_particles_list[-1]), generator=sub_gen, device=device)
+            check_indices = perm[:convergence_check_particles]
             check_particles = historical_particles_list[-1][check_indices]
             
             old_rewards = historical_rewards_list[-1][check_indices]
-            new_rewards = network['forward'](network_params, check_particles)
+            with torch.no_grad():
+                new_rewards = network['forward'](network_params, check_particles)
             
             print(f"  Convergence check:")
             for i in range(n_users):
-                change_i = jnp.mean(jnp.abs(new_rewards[:, i] - old_rewards[:, i]))
-                user_converged = change_i < convergence_threshold
-                user_convergence_status = user_convergence_status.at[i].set(user_converged)
-                status = "converged" if user_converged else "exploring"
-                print(f"    User {i + 1}: {change_i:.4f} [{status}]")
+                change_i = torch.mean(torch.abs(new_rewards[:, i] - old_rewards[:, i]))
+                user_converged = (change_i < convergence_threshold)
+                user_convergence_status[i] = user_converged
+                status = "converged" if bool(user_converged.item()) else "exploring"
+                print(f"    User {i + 1}: {float(change_i):.4f} [{status}]")
             
-            if jnp.all(user_convergence_status):
+            if bool(torch.all(user_convergence_status).item()):
                 diversity_enabled = False
                 print(f"  *** DIVERSITY DISABLED: All users converged ***")
             else:
-                n_still_exploring = jnp.sum(~user_convergence_status)
+                n_still_exploring = int((~user_convergence_status).sum().item())
                 print(f"  Diversity enabled: {n_still_exploring}/{n_users} users still exploring")
         
         # Compute gamma
@@ -218,13 +253,13 @@ def multi_user_budget_constrained_diffusion(
         print(f"  Gamma: {current_gamma:.3f} | Diversity: {diversity_enabled}")
         
         # Concatenate historical particles
-        historical_particles = jnp.concatenate(historical_particles_list, axis=0)
+        historical_particles = torch.cat(historical_particles_list, dim=0)
         print(f"  Historical particles: {len(historical_particles)}")
         
         # Generate particles
-        key, subkey = random.split(key)
-        particles = random.uniform(subkey, (n_particles, 2))
-        weights = jnp.zeros(n_particles)
+        sub_gen = _sub_generator(generator)
+        particles = torch.rand((n_particles, 2), generator=sub_gen, device=device)
+        weights = torch.zeros(n_particles, device=device)
         
         # Create network-based reward and gradient functions
         network_reward_fns, network_grad_fns = create_reward_and_gradient_functions(
@@ -239,7 +274,7 @@ def multi_user_budget_constrained_diffusion(
             beta_t=1.0,
             gamma_t=current_gamma,
             n_steps=n_steps,
-            key=subkey,
+            generator=sub_gen,
             network=None,
             network_params=None,
             historical_particles=historical_particles,
@@ -249,39 +284,41 @@ def multi_user_budget_constrained_diffusion(
         gamma_history.append(current_gamma)
         
         # Select top-k particles
-        sorted_indices = jnp.argsort(weights)
+        sorted_indices = torch.argsort(weights)
         observe_indices = sorted_indices[-k_observe:]
         
         selected_weights = weights[observe_indices]
-        print(f"    Weight range: [{jnp.min(weights):.2f}, {jnp.max(weights):.2f}]")
-        print(f"    Selected weights: [{jnp.min(selected_weights):.2f}, {jnp.max(selected_weights):.2f}]")
+        print(f"    Weight range: [{float(torch.min(weights)):.2f}, {float(torch.max(weights)):.2f}]")
+        print(f"    Selected weights: [{float(torch.min(selected_weights)):.2f}, {float(torch.max(selected_weights)):.2f}]")
         
-        # Observe rewards from all users
+        # Observe rewards from all users (no grad tracking)
         observed_particles = particles[observe_indices]
         observed_rewards_list = []
-        for i in range(n_users):
-            rewards_i = true_reward_fns[i](observed_particles)
-            observed_rewards_list.append(rewards_i)
-        observed_rewards = jnp.stack(observed_rewards_list, axis=1)
+        with torch.no_grad():
+            for i in range(n_users):
+                rewards_i = true_reward_fns[i](observed_particles)
+                observed_rewards_list.append(rewards_i)
+            observed_rewards = torch.stack(observed_rewards_list, dim=1)
         
         # Add to historical data
         historical_particles_list.append(observed_particles)
         historical_rewards_list.append(observed_rewards)
         
-        # Calculate success rates
-        per_user_success = jnp.array([
-            jnp.mean((observed_rewards[:, i] > 0.7).astype(float))
-            for i in range(n_users)
-        ])
-        # Overall success: concatenate all user rewards and compute success rate
-        overall_success = jnp.mean((observed_rewards > 0.7).astype(float))
+        # Calculate success rates (no grad tracking)
+        with torch.no_grad():
+            per_user_success = torch.stack([
+                torch.mean((observed_rewards[:, i] > 0.7).float())
+                for i in range(n_users)
+            ])
+            # Overall success: concatenate all user rewards and compute success rate
+            overall_success = torch.mean((observed_rewards > 0.7).float())
         
         success_rates_per_user_history.append(per_user_success)
         success_rates_overall_history.append(float(overall_success))
         
         # Train on all historical data
-        all_historical_particles = jnp.concatenate(historical_particles_list, axis=0)
-        all_historical_rewards = jnp.concatenate(historical_rewards_list, axis=0)
+        all_historical_particles = torch.cat(historical_particles_list, dim=0)
+        all_historical_rewards = torch.cat(historical_rewards_list, dim=0)
         
         print(f"  Training network on {len(all_historical_particles)} observations...")
         for epoch in range(50):
@@ -298,10 +335,20 @@ def multi_user_budget_constrained_diffusion(
         all_observed_rewards.append(observed_rewards)
         
         # Visualize
+        success_rates_per_user_history_py = [
+            [
+                (x.detach().cpu().item() if hasattr(x, 'detach') else float(x))
+                for x in step
+            ]
+            for step in success_rates_per_user_history
+        ]
         visualize_multi_user_step(
-            step_count, particles, weights,
-            observed_particles, observed_rewards,
-            success_rates_per_user_history, success_rates_overall_history,
+            step_count,
+            particles.detach().cpu().numpy(),
+            weights.detach().cpu().numpy(),
+            observed_particles.detach().cpu().numpy(),
+            observed_rewards.detach().cpu().numpy(),
+            success_rates_per_user_history_py, success_rates_overall_history,
             network, network_params, true_reward_fns, n_users
         )
         
@@ -311,17 +358,24 @@ def multi_user_budget_constrained_diffusion(
         step_count += 1
     
     # Final summary visualizations
+    success_rates_per_user_history_py = [
+        [
+            (x.detach().cpu().item() if hasattr(x, 'detach') else float(x))
+            for x in step
+        ]
+        for step in success_rates_per_user_history
+    ]
     visualize_multi_user_gamma_and_success(
         gamma_history,
-        success_rates_per_user_history,
+        success_rates_per_user_history_py,
         success_rates_overall_history,
-        all_weights,
+        [w.detach().cpu().numpy() for w in all_weights],
         k_observe,
         n_users
     )
     
     visualize_multi_user_final_results(
-        success_rates_per_user_history,
+        success_rates_per_user_history_py,
         success_rates_overall_history,
         gamma_history,
         n_users

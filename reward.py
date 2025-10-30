@@ -2,10 +2,9 @@
 Reward landscape functions and their gradients.
 """
 
-import jax
-import jax.numpy as jnp
+import torch
 
-def create_reward_landscape(x: jnp.ndarray) -> jnp.ndarray:
+def create_reward_landscape(x: torch.Tensor) -> torch.Tensor:
     """
     Create a synthetic reward landscape with values in [0,1].
     This is the 'true' reward function that we're trying to learn.
@@ -25,19 +24,19 @@ def create_reward_landscape(x: jnp.ndarray) -> jnp.ndarray:
         squeeze_output = False
     
     
-    # Initialize reward as JAX array with correct shape
-    reward = jnp.zeros(x.shape[0])
+    # Initialize reward tensor with correct shape
+    reward = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
     
     # Add multiple Gaussian peaks
     peaks = [(0.3, 0.7), (0.7, 0.3), (0.5, 0.5)]
     for peak_x, peak_y in peaks:
         # Calculate distance for each particle
-        dist = jnp.sqrt((x[:, 0] - peak_x)**2 + (x[:, 1] - peak_y)**2)
+        dist = torch.sqrt((x[:, 0] - peak_x)**2 + (x[:, 1] - peak_y)**2)
         # Add to reward (both should have shape (batch_size,))
-        reward = reward + jnp.exp(-dist**2 / 0.1)
+        reward = reward + torch.exp(-dist**2 / 0.1)
     
     # Ensure [0,1] range
-    reward = jnp.clip(reward, 0, 1)
+    reward = torch.clamp(reward, 0, 1)
     
     # Reshape back to original shape if needed
     if squeeze_output and original_shape == (2,):
@@ -46,16 +45,21 @@ def create_reward_landscape(x: jnp.ndarray) -> jnp.ndarray:
         reward = reward.reshape(original_shape[:-1])
     return reward
 
-def reward_landscape_gradient(x: jnp.ndarray) -> jnp.ndarray:
-    """Compute gradient of reward landscape using JAX autodiff."""
+def reward_landscape_gradient(x: torch.Tensor) -> torch.Tensor:
+    """Compute gradient of reward landscape using PyTorch autograd."""
+    def grad_single(single_x: torch.Tensor) -> torch.Tensor:
+        single_x = single_x.clone().detach().requires_grad_(True)
+        out = create_reward_landscape(single_x)
+        if out.ndim > 0:
+            out = out.sum()
+        grad = torch.autograd.grad(out, single_x, retain_graph=False, create_graph=False)[0]
+        return grad
     if x.ndim == 1:
-        return jax.grad(create_reward_landscape)(x)
-    else:
-        # For batch of particles, use vmap
-        grad_fn = jax.grad(create_reward_landscape)
-        return jax.vmap(grad_fn)(x)
+        return grad_single(x)
+    grads = [grad_single(xi) for xi in x]
+    return torch.stack(grads, dim=0)
 
-def create_four_optima_reward_landscape(x: jnp.ndarray) -> jnp.ndarray:
+def create_four_optima_reward_landscape(x: torch.Tensor) -> torch.Tensor:
     """
     Create reward landscape with four global optima in four quadrants.
     Peaks at approximately (0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)
@@ -75,16 +79,16 @@ def create_four_optima_reward_landscape(x: jnp.ndarray) -> jnp.ndarray:
         squeeze_output = False
     
     
-    # Initialize reward as JAX array with correct shape
-    reward = jnp.zeros(x.shape[0])
+    # Initialize reward tensor with correct shape
+    reward = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
     
     # Four equal peaks in four quadrants
     peaks = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)]
     for peak_x, peak_y in peaks:
-        dist = jnp.sqrt((x[:, 0] - peak_x)**2 + (x[:, 1] - peak_y)**2)
-        reward = reward + jnp.exp(-dist**2 / 0.05)  # Narrower peaks
+        dist = torch.sqrt((x[:, 0] - peak_x)**2 + (x[:, 1] - peak_y)**2)
+        reward = reward + torch.exp(-dist**2 / 0.05)  # Narrower peaks
     
-    reward = jnp.clip(reward, 0, 1)  # Just clip to [0,1]
+    reward = torch.clamp(reward, 0, 1)  # Just clip to [0,1]
     
     # Reshape back to original shape if needed
     if squeeze_output and original_shape == (2,):
@@ -94,15 +98,21 @@ def create_four_optima_reward_landscape(x: jnp.ndarray) -> jnp.ndarray:
     
     return reward
 
-def four_optima_reward_gradient(x: jnp.ndarray) -> jnp.ndarray:
-    """Compute gradient of four optima reward landscape."""
+def four_optima_reward_gradient(x: torch.Tensor) -> torch.Tensor:
+    """Compute gradient of four optima reward landscape using PyTorch autograd."""
+    def grad_single(single_x: torch.Tensor) -> torch.Tensor:
+        single_x = single_x.clone().detach().requires_grad_(True)
+        out = create_four_optima_reward_landscape(single_x)
+        if out.ndim > 0:
+            out = out.sum()
+        grad = torch.autograd.grad(out, single_x, retain_graph=False, create_graph=False)[0]
+        return grad
     if x.ndim == 1:
-        return jax.grad(create_four_optima_reward_landscape)(x)
-    else:
-        grad_fn = jax.grad(create_four_optima_reward_landscape)
-        return jax.vmap(grad_fn)(x)
+        return grad_single(x)
+    grads = [grad_single(xi) for xi in x]
+    return torch.stack(grads, dim=0)
 
-def create_three_mode_reward_landscape(x: jnp.ndarray) -> jnp.ndarray:
+def create_three_mode_reward_landscape(x: torch.Tensor) -> torch.Tensor:
     """
     Create reward landscape with three modes:
     1. Lower left quadrant (0.25, 0.25) - coincides with lower left of four quadrants
@@ -123,16 +133,16 @@ def create_three_mode_reward_landscape(x: jnp.ndarray) -> jnp.ndarray:
         x = x.reshape(-1, x.shape[-1])
         squeeze_output = False
     
-    # Initialize reward as JAX array with correct shape
-    reward = jnp.zeros(x.shape[0])
+    # Initialize reward tensor with correct shape
+    reward = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
     
     # Three peaks: lower left, center, upper right
     peaks = [(0.25, 0.25), (0.5, 0.5), (0.75, 0.75)]
     for peak_x, peak_y in peaks:
-        dist = jnp.sqrt((x[:, 0] - peak_x)**2 + (x[:, 1] - peak_y)**2)
-        reward = reward + jnp.exp(-dist**2 / 0.03)  # Steeper peaks
+        dist = torch.sqrt((x[:, 0] - peak_x)**2 + (x[:, 1] - peak_y)**2)
+        reward = reward + torch.exp(-dist**2 / 0.03)  # Steeper peaks
     
-    reward = jnp.clip(reward, 0, 1)  # Just clip to [0,1]
+    reward = torch.clamp(reward, 0, 1)  # Just clip to [0,1]
     
     # Reshape back to original shape if needed
     if squeeze_output and original_shape == (2,):
@@ -142,10 +152,16 @@ def create_three_mode_reward_landscape(x: jnp.ndarray) -> jnp.ndarray:
     
     return reward
 
-def three_mode_reward_gradient(x: jnp.ndarray) -> jnp.ndarray:
-    """Compute gradient of three mode reward landscape."""
+def three_mode_reward_gradient(x: torch.Tensor) -> torch.Tensor:
+    """Compute gradient of three mode reward landscape using PyTorch autograd."""
+    def grad_single(single_x: torch.Tensor) -> torch.Tensor:
+        single_x = single_x.clone().detach().requires_grad_(True)
+        out = create_three_mode_reward_landscape(single_x)
+        if out.ndim > 0:
+            out = out.sum()
+        grad = torch.autograd.grad(out, single_x, retain_graph=False, create_graph=False)[0]
+        return grad
     if x.ndim == 1:
-        return jax.grad(create_three_mode_reward_landscape)(x)
-    else:
-        grad_fn = jax.grad(create_three_mode_reward_landscape)
-        return jax.vmap(grad_fn)(x)
+        return grad_single(x)
+    grads = [grad_single(xi) for xi in x]
+    return torch.stack(grads, dim=0)

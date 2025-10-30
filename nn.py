@@ -2,45 +2,40 @@
 Neural network components for reward learning.
 """
 
-import jax
-import jax.numpy as jnp
-import jax.random as random
-import optax
+import torch
+import torch.nn.functional as F
+from torch.func import vmap, grad as func_grad
 
 def create_cnn_reward_network():
     """
     Create a CNN for reward prediction that treats 2D coordinates as spatial features.
     """
-    def init_fn(key):
+    def init_fn(generator: torch.Generator | None):
         """Initialize CNN parameters."""
         params = {}
+        dev = getattr(generator, "device", torch.device("cpu")) if generator is not None else torch.device("cpu")
         
         # Feature expansion layer: 2 -> 32
-        key, subkey = random.split(key)
-        params['expand_W'] = random.normal(subkey, (2, 32)) * 0.1
-        params['expand_b'] = jnp.zeros(32)
+        params['expand_W'] = torch.randn((2, 32), generator=generator, device=dev) * 0.1
+        params['expand_b'] = torch.zeros(32, device=dev)
         
         # Conv layers (we'll simulate with dense layers on feature representations)
-        key, subkey = random.split(key)
-        params['conv1_W'] = random.normal(subkey, (32, 64)) * 0.1
-        params['conv1_b'] = jnp.zeros(64)
+        params['conv1_W'] = torch.randn((32, 64), generator=generator, device=dev) * 0.1
+        params['conv1_b'] = torch.zeros(64, device=dev)
         
-        key, subkey = random.split(key)
-        params['conv2_W'] = random.normal(subkey, (64, 64)) * 0.1
-        params['conv2_b'] = jnp.zeros(64)
+        params['conv2_W'] = torch.randn((64, 64), generator=generator, device=dev) * 0.1
+        params['conv2_b'] = torch.zeros(64, device=dev)
         
         # Fully connected layers
-        key, subkey = random.split(key)
-        params['fc1_W'] = random.normal(subkey, (64, 32)) * 0.1
-        params['fc1_b'] = jnp.zeros(32)
+        params['fc1_W'] = torch.randn((64, 32), generator=generator, device=dev) * 0.1
+        params['fc1_b'] = torch.zeros(32, device=dev)
         
-        key, subkey = random.split(key)
-        params['fc2_W'] = random.normal(subkey, (32, 1)) * 0.1
-        params['fc2_b'] = jnp.zeros(1)
+        params['fc2_W'] = torch.randn((32, 1), generator=generator, device=dev) * 0.1
+        params['fc2_b'] = torch.zeros(1, device=dev)
         
         return params
     
-    def forward(params, x):
+    def forward(params, x: torch.Tensor):
         """Forward pass through CNN."""
         # Handle both single particle and batch
         if x.ndim == 1:
@@ -50,24 +45,24 @@ def create_cnn_reward_network():
             squeeze_output = False
         
         # Feature expansion
-        h = jnp.dot(x, params['expand_W']) + params['expand_b']
-        h = jax.nn.relu(h)
+        h = x @ params['expand_W'] + params['expand_b']
+        h = F.relu(h)
         
         # Conv-like layer 1
-        h = jnp.dot(h, params['conv1_W']) + params['conv1_b']
-        h = jax.nn.relu(h)
+        h = h @ params['conv1_W'] + params['conv1_b']
+        h = F.relu(h)
         
         # Conv-like layer 2
-        h = jnp.dot(h, params['conv2_W']) + params['conv2_b']
-        h = jax.nn.relu(h)
+        h = h @ params['conv2_W'] + params['conv2_b']
+        h = F.relu(h)
         
         # Fully connected layer 1
-        h = jnp.dot(h, params['fc1_W']) + params['fc1_b']
-        h = jax.nn.relu(h)
+        h = h @ params['fc1_W'] + params['fc1_b']
+        h = F.relu(h)
         
         # Output layer: predict actual reward value [0,1]
-        h = jnp.dot(h, params['fc2_W']) + params['fc2_b']
-        h = jax.nn.sigmoid(h)  # Output in [0,1]
+        h = h @ params['fc2_W'] + params['fc2_b']
+        h = torch.sigmoid(h)  # Output in [0,1]
         
         
         # CRITICAL FIX: Ensure output is 1D for batch inputs
@@ -82,44 +77,55 @@ def create_cnn_reward_network():
     
     return {'init': init_fn, 'forward': forward}
 
-def update_network(network, params, optimizer, opt_state, x_batch, y_batch):
-    """Update neural network parameters using observed rewards."""
-    def loss_fn(params):
-        predictions = network['forward'](params, x_batch)
-        
-        # Ensure shapes match
-        if predictions.shape != y_batch.shape:
-            if predictions.ndim > y_batch.ndim:
-                # Remove extra dimensions
-                while predictions.ndim > y_batch.ndim:
-                    predictions = predictions.squeeze(-1)
-            elif predictions.ndim < y_batch.ndim:
-                # Add missing dimensions
-                while predictions.ndim < y_batch.ndim:
-                    predictions = predictions.unsqueeze(-1)
-        
-        # MSE loss on actual reward values [0,1]
-        return jnp.mean((predictions - y_batch)**2)
-    
-    loss, grads = jax.value_and_grad(loss_fn)(params)
-    updates, new_opt_state = optimizer.update(grads, opt_state)
-    new_params = optax.apply_updates(params, updates)
-    return new_params, new_opt_state, loss
+def _collect_param_tensors(params):
+    tensors = []
+    for v in params.values():
+        if isinstance(v, dict):
+            tensors.extend(_collect_param_tensors(v))
+        else:
+            if torch.is_tensor(v):
+                tensors.append(v)
+    return tensors
 
-def reward_network_gradient(network, params, x):
-    """Compute gradient of reward network using JAX autodiff with numerical stability."""
-    # For vectorized inputs, we need to compute gradients for each particle
-    if x.ndim == 2:  # Batch of particles
-        # Use vmap to vectorize the gradient computation
-        grad_fn = jax.grad(lambda single_x: network['forward'](params, single_x))
-        grad = jax.vmap(grad_fn)(x)
-    else:  # Single particle
-        grad = jax.grad(lambda single_x: network['forward'](params, single_x))(x)
+def update_network(network, params, optimizer, opt_state, x_batch, y_batch):
+    """Update neural network parameters using observed rewards (PyTorch)."""
+    # clear stale grads before new backward
+    for t in _collect_param_tensors(params):
+        if t.grad is not None:
+            t.grad = None
+
+    # ensure training data is not part of any autograd graph
+    x_batch = x_batch.detach()
+    y_batch = y_batch.detach()
+    predictions = network['forward'](params, x_batch)
     
-    # Add numerical stability: clip gradients to prevent extreme values
-    grad = jnp.clip(grad, -10.0, 10.0)
+    # Ensure shapes match
+    if predictions.shape != y_batch.shape:
+        if predictions.ndim > y_batch.ndim:
+            while predictions.ndim > y_batch.ndim:
+                predictions = predictions.squeeze(-1)
+        elif predictions.ndim < y_batch.ndim:
+            while predictions.ndim < y_batch.ndim:
+                predictions = predictions.unsqueeze(-1)
     
-    # Check for NaN values and replace with zeros
-    grad = jnp.where(jnp.isnan(grad) | jnp.isinf(grad), 0.0, grad)
+    loss_tensor = torch.mean((predictions - y_batch) ** 2)
+    optimizer.zero_grad(set_to_none=True)
+    loss_tensor.backward()
+    optimizer.step()
     
-    return grad
+    return params, None, float(loss_tensor.item())
+
+def reward_network_gradient(network, params, x: torch.Tensor):
+    """Compute gradient of reward network using PyTorch autograd with numerical stability."""
+    def f(single_x: torch.Tensor) -> torch.Tensor:
+        out = network['forward'](params, single_x)
+        return out.sum() if out.ndim > 0 else out
+
+    grad_f = func_grad(f)
+    if x.ndim == 2:
+        grads = vmap(grad_f)(x)
+    else:
+        grads = grad_f(x)
+    grads = torch.clamp(grads, -10.0, 10.0)
+    grads = torch.where(torch.isnan(grads) | torch.isinf(grads), torch.zeros_like(grads), grads)
+    return grads

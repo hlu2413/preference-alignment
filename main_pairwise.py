@@ -3,9 +3,7 @@ Main FKC diffusion algorithm with pairwise preference learning.
 Uses pairwise comparisons instead of direct reward observations.
 """
 
-import jax
-import jax.numpy as jnp
-import jax.random as random
+import torch
 import optax
 from typing import Tuple, Dict, List
 from reward import create_four_optima_reward_landscape, four_optima_reward_gradient
@@ -19,10 +17,30 @@ from pairwise_learning import (
 from visualization import visualize_base_model_distribution, visualize_step, visualize_gamma_and_diversity
 
 
-def create_pairwise_comparisons(particles: jnp.ndarray, 
-                                weights: jnp.ndarray, 
+def _sub_generator(generator: torch.Generator | None) -> torch.Generator | None:
+    if generator is None:
+        return None
+    device = getattr(generator, "device", "cpu")
+    new_gen = torch.Generator(device=device)
+    seed_tensor = torch.randint(0, 2**31 - 1, (1,), device=device, generator=generator)
+    new_gen.manual_seed(int(seed_tensor.item()))
+    return new_gen
+
+def _collect_param_tensors(params):
+    tensors = []
+    for v in params.values():
+        if isinstance(v, dict):
+            tensors.extend(_collect_param_tensors(v))
+        else:
+            if torch.is_tensor(v):
+                tensors.append(v)
+    return tensors
+
+
+def create_pairwise_comparisons(particles: torch.Tensor, 
+                                weights: torch.Tensor, 
                                 k_observe: int, 
-                                key: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+                                generator: torch.Generator | None) -> Tuple[torch.Tensor, torch.Generator | None]:
     """
     Select top-k particles and create k random pairs.
     Ensures no self-pairing.
@@ -38,34 +56,36 @@ def create_pairwise_comparisons(particles: jnp.ndarray,
         key: updated random key
     """
     # Get top k particles by weight
-    top_k_indices = jnp.argsort(weights)[-k_observe:]
+    top_k_indices = torch.argsort(weights)[-k_observe:]
     top_k_particles = particles[top_k_indices]
     
     # Create k pairs by random sampling with no self-pairing
     pairs_list = []
     
     for i in range(k_observe):
-        key, subkey1, subkey2 = random.split(key, 3)
+        sub_gen1 = _sub_generator(generator)
+        sub_gen2 = _sub_generator(generator)
         
         # Sample two different indices
-        idx1 = random.choice(subkey1, k_observe)
-        idx2 = random.choice(subkey2, k_observe)
+        dev = getattr(generator, "device", torch.device("cpu"))
+        idx1 = int(torch.randint(0, k_observe, (1,), generator=sub_gen1, device=dev))
+        idx2 = int(torch.randint(0, k_observe, (1,), generator=sub_gen2, device=dev))
         
         # Ensure no self-pairing
         attempts = 0
         while idx2 == idx1 and attempts < 100:
-            key, subkey2 = random.split(key)
-            idx2 = random.choice(subkey2, k_observe)
+            sub_gen2 = _sub_generator(generator)
+            idx2 = int(torch.randint(0, k_observe, (1,), generator=sub_gen2, device=dev))
             attempts += 1
         
         pairs_list.append([top_k_particles[idx1], top_k_particles[idx2]])
     
-    pairs = jnp.array(pairs_list)  # (k, 2, 2)
-    return pairs, key
+    pairs = torch.stack([torch.stack(p, dim=0) for p in pairs_list], dim=0)  # (k, 2, 2)
+    return pairs, generator
 
 
-def observe_preferences(pairs: jnp.ndarray, 
-                       true_reward_fn) -> Tuple[jnp.ndarray, jnp.ndarray]:
+def observe_preferences(pairs: torch.Tensor, 
+                       true_reward_fn) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Determine winner and loser for each pair based on true rewards.
     
@@ -82,11 +102,11 @@ def observe_preferences(pairs: jnp.ndarray,
     rewards_1 = true_reward_fn(pairs[:, 1, :])  # (k,) rewards for second particle
     
     # Determine winners: 1 if second particle wins, 0 if first wins
-    winner_is_1 = (rewards_1 > rewards_0).astype(float)
+    winner_is_1 = (rewards_1 > rewards_0).float()
     
     # Extract winners and losers based on comparison
-    winners = jnp.where(winner_is_1[:, None], pairs[:, 1, :], pairs[:, 0, :])
-    losers = jnp.where(winner_is_1[:, None], pairs[:, 0, :], pairs[:, 1, :])
+    winners = torch.where(winner_is_1[:, None].bool(), pairs[:, 1, :], pairs[:, 0, :])
+    losers = torch.where(winner_is_1[:, None].bool(), pairs[:, 0, :], pairs[:, 1, :])
     
     return winners, losers
 
@@ -127,20 +147,25 @@ def budget_constrained_diffusion_pairwise(k_observe: int,
         raise ValueError("k_observe must be <= n_particles")
     
     # Initialize
-    key = random.PRNGKey(42)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    generator = torch.Generator(device=device)
+    generator.manual_seed(42)
     
     # Network setup - use preference CNN
     if network is None:
         network = create_preference_cnn(input_dim=2, hidden_channels=16)
-        key, subkey = random.split(key)
-        network_params = network['init'](subkey)
-        optimizer = optax.adam(learning_rate=0.01)
-        opt_state = optimizer.init(network_params)
+        sub_gen = _sub_generator(generator)
+        network_params = network['init'](sub_gen)
+        for v in _collect_param_tensors(network_params):
+            v.data = v.data.to(device)
+            v.requires_grad_(True)
+        optimizer = torch.optim.Adam(_collect_param_tensors(network_params), lr=0.01)
+        opt_state = None
         print("  Created new preference learning network")
     else:
-        optimizer = optax.adam(learning_rate=0.01)
         if opt_state is None:
-            opt_state = optimizer.init(network_params)
+            optimizer = torch.optim.Adam(_collect_param_tensors(network_params), lr=0.01)
+            opt_state = None
         print("  Using pre-trained preference network (continuing training)")
     
     # Storage for results
@@ -164,54 +189,62 @@ def budget_constrained_diffusion_pairwise(k_observe: int,
     convergence_threshold = 0.03
     convergence_check_particles = 10
     
-    # Estimate total steps
-    total_steps = B // (k_observe * 2)  # Each pair uses 2 observations
+    # Estimate total steps (charge per unique observation of particle)
+    total_steps = B // k_observe
     step_count = 0
     
     # === COLD START (Step 0) ===
     print(f"Step {step_count} [COLD START], Budget remaining: {B}")
     
-    key, subkey = random.split(key)
-    particles = random.uniform(subkey, (k_observe, 2))
+    sub_gen = _sub_generator(generator)
+    particles = torch.rand((k_observe, 2), generator=sub_gen, device=device)
     
     # Run baseline diffusion
     dt = -1.0 / n_steps
     for i in range(n_steps):
         t = 1.0 + i * dt
-        key, subkey = random.split(key)
-        particles = baseline_sde_step(particles, t, dt, subkey)
+        sub_gen = _sub_generator(generator)
+        particles = baseline_sde_step(particles, t, dt, sub_gen)
     
-    particles = jnp.clip(particles, 0, 1)
+    particles = torch.clamp(particles, 0, 1)
     
-    # Create initial pairs from cold start particles
-    # Since we don't have weights yet, create random pairs
+    # Observe k unique particles once, then create random pairs and derive winners from cached rewards
+    with torch.no_grad():
+        true_rewards_k = reward_fn(particles)  # (k,)
+    
     pairs = []
+    winners_list = []
+    losers_list = []
     for i in range(k_observe):
-        key, subkey1, subkey2 = random.split(key, 3)
-        idx1 = random.choice(subkey1, k_observe)
-        idx2 = random.choice(subkey2, k_observe)
-        
-        # Ensure no self-pairing
+        sub_gen1 = _sub_generator(generator)
+        sub_gen2 = _sub_generator(generator)
+        dev = getattr(generator, "device", torch.device("cpu"))
+        idx1 = int(torch.randint(0, k_observe, (1,), generator=sub_gen1, device=dev))
+        idx2 = int(torch.randint(0, k_observe, (1,), generator=sub_gen2, device=dev))
         attempts = 0
         while idx2 == idx1 and attempts < 100:
-            key, subkey2 = random.split(key)
-            idx2 = random.choice(subkey2, k_observe)
+            sub_gen2 = _sub_generator(generator)
+            idx2 = int(torch.randint(0, k_observe, (1,), generator=sub_gen2, device=dev))
             attempts += 1
-        
         pairs.append([particles[idx1], particles[idx2]])
+        if true_rewards_k[idx1] >= true_rewards_k[idx2]:
+            winners_list.append(particles[idx1])
+            losers_list.append(particles[idx2])
+        else:
+            winners_list.append(particles[idx2])
+            losers_list.append(particles[idx1])
     
-    pairs = jnp.array(pairs)  # (k, 2, 2)
-    
-    # Observe preferences
-    winners, losers = observe_preferences(pairs, reward_fn)
+    pairs = torch.stack([torch.stack(p, dim=0) for p in pairs], dim=0)
+    winners = torch.stack(winners_list, dim=0)
+    losers = torch.stack(losers_list, dim=0)
     
     # Add to historical data
     historical_winners_list.append(winners)
     historical_losers_list.append(losers)
     
     # Train on all historical data
-    all_historical_winners = jnp.concatenate(historical_winners_list, axis=0)
-    all_historical_losers = jnp.concatenate(historical_losers_list, axis=0)
+    all_historical_winners = torch.cat(historical_winners_list, dim=0)
+    all_historical_losers = torch.cat(historical_losers_list, dim=0)
     
     print(f"  Training preference network on {len(all_historical_winners)} pairs")
     for epoch in range(50):
@@ -221,28 +254,34 @@ def budget_constrained_diffusion_pairwise(k_observe: int,
         )
     print(f"    Loss: {loss:.4f}")
     
-    # Compute success rate based on learned rewards
-    winner_rewards = network['forward'](network_params, winners)
-    loser_rewards = network['forward'](network_params, losers)
-    # Success: winner has reward > 0.7 OR winner > loser
-    success_rate = jnp.mean((winner_rewards > loser_rewards).astype(float))
-    success_rates.append(success_rate)
+    # Compute success rate: percentage of high-reward particles among observed set
+    success_rate = torch.mean((true_rewards_k > 0.7).float())
+    success_rates.append(float(success_rate.item()))
     
-    # Store learned rewards for convergence check
-    historical_winner_learned_rewards_list.append(winner_rewards)
+    # Store learned rewards for convergence check (on winners)
+    winner_rewards_learned_cold = network['forward'](network_params, winners)
+    historical_winner_learned_rewards_list.append(winner_rewards_learned_cold.detach())
     
     all_particles.append(particles)
-    all_weights.append(jnp.ones(len(particles)))
+    all_weights.append(torch.ones(len(particles), device=device))
     all_pairs.append(pairs)
     all_winners.append(winners)
     all_losers.append(losers)
     
-    B -= k_observe * 2  # Each pair uses 2 observations
+    # Charge budget for k unique observations only
+    B -= k_observe
     step_count += 1
     
-    # Visualization (using winners as "observed particles" for compatibility)
-    visualize_step(step_count, particles, jnp.ones(len(particles)), winners, 
-                  winner_rewards, success_rates, network, network_params, reward_fn)
+    # Visualization: show observed particles (k) and their true rewards
+    visualize_step(
+        step_count,
+        particles.detach().cpu().numpy(),
+        torch.ones(len(particles)).detach().cpu().numpy(),
+        particles.detach().cpu().numpy(),
+        true_rewards_k.detach().cpu().numpy(),
+        [float(s.item()) if torch.is_tensor(s) else float(s) for s in success_rates],
+        network, network_params, reward_fn
+    )
     
     # === MAIN LOOP (Step 1 onwards) ===
     while B > 0:
@@ -251,9 +290,9 @@ def budget_constrained_diffusion_pairwise(k_observe: int,
         # Check for neural network convergence
         if diversity_enabled and len(historical_winners_list) > 0:
             # Randomly sample particles from previous step
-            key, subkey = random.split(key)
-            check_indices = random.choice(subkey, len(historical_winners_list[-1]), 
-                                       (convergence_check_particles,), replace=False)
+            sub_gen = _sub_generator(generator)
+            perm = torch.randperm(len(historical_winners_list[-1]), generator=sub_gen, device=device)
+            check_indices = perm[:convergence_check_particles]
             check_particles = historical_winners_list[-1][check_indices]
             
             # Get old and new reward estimates
@@ -261,8 +300,8 @@ def budget_constrained_diffusion_pairwise(k_observe: int,
             new_rewards = network['forward'](network_params, check_particles)
             
             # Check convergence
-            reward_change = jnp.mean(jnp.abs(new_rewards - old_rewards))
-            print(f"  Convergence check: {reward_change:.4f}")
+            reward_change = torch.mean(torch.abs(new_rewards - old_rewards))
+            print(f"  Convergence check: {float(reward_change):.4f}")
             
             if reward_change < convergence_threshold:
                 diversity_enabled = False
@@ -273,13 +312,13 @@ def budget_constrained_diffusion_pairwise(k_observe: int,
         print(f"  Gamma: {current_gamma:.3f} | Diversity: {diversity_enabled}")
         
         # Concatenate all historical winners for diversity computation
-        historical_particles = jnp.concatenate(historical_winners_list, axis=0)
+        historical_particles = torch.cat(historical_winners_list, dim=0)
         print(f"  Historical particles: {len(historical_particles)}")
         
         # Generate particles
-        key, subkey = random.split(key)
-        particles = random.uniform(subkey, (n_particles, 2))
-        weights = jnp.zeros(n_particles)
+        sub_gen = _sub_generator(generator)
+        particles = torch.rand((n_particles, 2), generator=sub_gen, device=device)
+        weights = torch.zeros(n_particles, device=device)
         
         # Create reward and gradient functions from learned network
         reward_fn_learned, reward_grad_fn = create_reward_and_gradient_functions(
@@ -293,7 +332,7 @@ def budget_constrained_diffusion_pairwise(k_observe: int,
             beta_t=1.0,
             gamma_t=current_gamma,
             n_steps=n_steps,
-            key=subkey,
+            generator=sub_gen,
             network=network,
             network_params=network_params,
             historical_particles=historical_particles,
@@ -303,23 +342,47 @@ def budget_constrained_diffusion_pairwise(k_observe: int,
         # Store gamma
         gamma_history.append(current_gamma)
         
-        # Create pairwise comparisons from top-k particles
-        pairs, key = create_pairwise_comparisons(particles, weights, k_observe, key)
-        
-        selected_weights_indices = jnp.argsort(weights)[-k_observe:]
+        # Select top-k and observe their true rewards once
+        selected_weights_indices = torch.argsort(weights)[-k_observe:]
         selected_weights = weights[selected_weights_indices]
-        print(f"    Weight range: [{jnp.min(weights):.2f}, {jnp.max(weights):.2f}] | Selected: [{jnp.min(selected_weights):.2f}, {jnp.max(selected_weights):.2f}]")
+        selected_particles = particles[selected_weights_indices]
+        print(f"    Weight range: [{float(torch.min(weights)):.2f}, {float(torch.max(weights)):.2f}] | Selected: [{float(torch.min(selected_weights)):.2f}, {float(torch.max(selected_weights)):.2f}]")
+        with torch.no_grad():
+            true_rewards_k = reward_fn(selected_particles)
         
-        # Observe preferences (ground truth)
-        winners, losers = observe_preferences(pairs, reward_fn)
+        # Create pairwise comparisons from the selected set (no extra observations needed)
+        pairs_list = []
+        winners_list = []
+        losers_list = []
+        for i in range(k_observe):
+            sub_gen1 = _sub_generator(generator)
+            sub_gen2 = _sub_generator(generator)
+            dev = getattr(generator, "device", torch.device("cpu"))
+            idx1 = int(torch.randint(0, k_observe, (1,), generator=sub_gen1, device=dev))
+            idx2 = int(torch.randint(0, k_observe, (1,), generator=sub_gen2, device=dev))
+            attempts = 0
+            while idx2 == idx1 and attempts < 100:
+                sub_gen2 = _sub_generator(generator)
+                idx2 = int(torch.randint(0, k_observe, (1,), generator=sub_gen2, device=dev))
+                attempts += 1
+            pairs_list.append([selected_particles[idx1], selected_particles[idx2]])
+            if true_rewards_k[idx1] >= true_rewards_k[idx2]:
+                winners_list.append(selected_particles[idx1])
+                losers_list.append(selected_particles[idx2])
+            else:
+                winners_list.append(selected_particles[idx2])
+                losers_list.append(selected_particles[idx1])
+        pairs = torch.stack([torch.stack(p, dim=0) for p in pairs_list], dim=0)
+        winners = torch.stack(winners_list, dim=0)
+        losers = torch.stack(losers_list, dim=0)
         
         # Add to historical data
         historical_winners_list.append(winners)
         historical_losers_list.append(losers)
         
         # Train on ALL historical preferences
-        all_historical_winners = jnp.concatenate(historical_winners_list, axis=0)
-        all_historical_losers = jnp.concatenate(historical_losers_list, axis=0)
+        all_historical_winners = torch.cat(historical_winners_list, dim=0)
+        all_historical_losers = torch.cat(historical_losers_list, dim=0)
         
         print(f"  Training preference network on {len(all_historical_winners)} pairs...")
         for epoch in range(50):
@@ -329,14 +392,13 @@ def budget_constrained_diffusion_pairwise(k_observe: int,
             )
         print(f"    Loss: {loss:.4f}")
         
-        # Compute success rate based on learned rewards
-        winner_rewards_learned = network['forward'](network_params, winners)
-        loser_rewards_learned = network['forward'](network_params, losers)
-        success_rate = jnp.mean((winner_rewards_learned > loser_rewards_learned).astype(float))
-        success_rates.append(success_rate)
+        # Compute success rate: percentage of high-reward particles among observed set
+        success_rate = torch.mean((true_rewards_k > 0.7).float())
+        success_rates.append(float(success_rate.item()))
         
-        # Store learned rewards for convergence check
-        historical_winner_learned_rewards_list.append(winner_rewards_learned)
+        # Store learned rewards for convergence check (on winners)
+        winner_rewards_learned = network['forward'](network_params, winners)
+        historical_winner_learned_rewards_list.append(winner_rewards_learned.detach())
         
         # Store results
         all_particles.append(particles)
@@ -346,13 +408,21 @@ def budget_constrained_diffusion_pairwise(k_observe: int,
         all_losers.append(losers)
         
         # Update budget
-        n_to_observe = min(k_observe * 2, B)  # Each pair uses 2 observations
+        # Charge budget for k unique observations only
+        n_to_observe = min(k_observe, B)
         B -= n_to_observe
         step_count += 1
         
-        # Visualize (using winners as proxy for observed particles)
-        visualize_step(step_count, particles, weights, winners, 
-                      winner_rewards_learned, success_rates, network, network_params, reward_fn)
+        # Visualize: show observed particles (k) and their true rewards
+        visualize_step(
+            step_count,
+            particles.detach().cpu().numpy(),
+            weights.detach().cpu().numpy(),
+            selected_particles.detach().cpu().numpy(),
+            true_rewards_k.detach().cpu().numpy(),
+            [float(s.item()) if torch.is_tensor(s) else float(s) for s in success_rates],
+            network, network_params, reward_fn
+        )
     
     # Return results
     return (all_particles, all_weights, all_pairs, all_winners, all_losers,

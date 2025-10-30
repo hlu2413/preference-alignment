@@ -4,49 +4,47 @@ Transformer feature extractor + Multi-head MLP architecture.
 Learns rewards from positions, gradients computed via autodiff.
 """
 
-import jax
-import jax.numpy as jnp
-import jax.random as random
-import optax
+import torch
+import torch.nn.functional as F
 from typing import Tuple, List, Callable, Dict
+from torch.func import vmap, grad as func_grad
 
 
-def layer_norm(x: jnp.ndarray, scale: jnp.ndarray, bias: jnp.ndarray, 
-               eps: float = 1e-5) -> jnp.ndarray:
+def layer_norm(x: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor, 
+               eps: float = 1e-5) -> torch.Tensor:
     """Layer normalization"""
-    mean = jnp.mean(x, axis=-1, keepdims=True)
-    var = jnp.var(x, axis=-1, keepdims=True)
-    return scale * (x - mean) / jnp.sqrt(var + eps) + bias
+    mean = torch.mean(x, dim=-1, keepdim=True)
+    var = torch.var(x, dim=-1, keepdim=True, unbiased=False)
+    return scale * (x - mean) / torch.sqrt(var + eps) + bias
 
 
-def init_transformer_block(key: jnp.ndarray, d_model: int, n_heads: int) -> Dict:
+def init_transformer_block(generator: torch.Generator | None, d_model: int, n_heads: int) -> Dict:
     """Initialize parameters for a single Transformer block"""
     params = {}
     
     # Multi-head attention
-    key, *subkeys = random.split(key, 5)
-    params['Q_W'] = random.normal(subkeys[0], (d_model, d_model)) * 0.1
-    params['K_W'] = random.normal(subkeys[1], (d_model, d_model)) * 0.1
-    params['V_W'] = random.normal(subkeys[2], (d_model, d_model)) * 0.1
-    params['O_W'] = random.normal(subkeys[3], (d_model, d_model)) * 0.1
+    dev = getattr(generator, "device", torch.device("cpu")) if generator is not None else torch.device("cpu")
+    params['Q_W'] = torch.randn((d_model, d_model), generator=generator, device=dev) * 0.1
+    params['K_W'] = torch.randn((d_model, d_model), generator=generator, device=dev) * 0.1
+    params['V_W'] = torch.randn((d_model, d_model), generator=generator, device=dev) * 0.1
+    params['O_W'] = torch.randn((d_model, d_model), generator=generator, device=dev) * 0.1
     
     # Layer norm parameters
-    params['norm1_scale'] = jnp.ones(d_model)
-    params['norm1_bias'] = jnp.zeros(d_model)
-    params['norm2_scale'] = jnp.ones(d_model)
-    params['norm2_bias'] = jnp.zeros(d_model)
+    params['norm1_scale'] = torch.ones(d_model, device=dev)
+    params['norm1_bias'] = torch.zeros(d_model, device=dev)
+    params['norm2_scale'] = torch.ones(d_model, device=dev)
+    params['norm2_bias'] = torch.zeros(d_model, device=dev)
     
     # Feed-forward network
-    key, *subkeys = random.split(key, 3)
-    params['ffn_W1'] = random.normal(subkeys[0], (d_model, d_model * 4)) * 0.1
-    params['ffn_b1'] = jnp.zeros(d_model * 4)
-    params['ffn_W2'] = random.normal(subkeys[1], (d_model * 4, d_model)) * 0.1
-    params['ffn_b2'] = jnp.zeros(d_model)
+    params['ffn_W1'] = torch.randn((d_model, d_model * 4), generator=generator, device=dev) * 0.1
+    params['ffn_b1'] = torch.zeros(d_model * 4, device=dev)
+    params['ffn_W2'] = torch.randn((d_model * 4, d_model), generator=generator, device=dev) * 0.1
+    params['ffn_b2'] = torch.zeros(d_model, device=dev)
     
     return params
 
 
-def transformer_block_forward(params: Dict, x: jnp.ndarray) -> jnp.ndarray:
+def transformer_block_forward(params: Dict, x: torch.Tensor) -> torch.Tensor:
     """
     Forward pass through Transformer block
     
@@ -60,24 +58,24 @@ def transformer_block_forward(params: Dict, x: jnp.ndarray) -> jnp.ndarray:
     d_model = x.shape[-1]
     
     # Multi-head self-attention
-    Q = jnp.dot(x, params['Q_W'])
-    K = jnp.dot(x, params['K_W'])
-    V = jnp.dot(x, params['V_W'])
+    Q = x @ params['Q_W']
+    K = x @ params['K_W']
+    V = x @ params['V_W']
     
     # Scaled dot-product attention
-    scores = jnp.matmul(Q, K.transpose(0, 2, 1)) / jnp.sqrt(d_model)
-    attn_weights = jax.nn.softmax(scores, axis=-1)
-    attn_out = jnp.matmul(attn_weights, V)
-    attn_out = jnp.dot(attn_out, params['O_W'])
+    scores = torch.matmul(Q, K.transpose(1, 2)) / torch.sqrt(torch.tensor(float(d_model)))
+    attn_weights = torch.softmax(scores, dim=-1)
+    attn_out = torch.matmul(attn_weights, V)
+    attn_out = attn_out @ params['O_W']
     
     # Residual connection + layer norm
     x = x + attn_out
     x = layer_norm(x, params['norm1_scale'], params['norm1_bias'])
     
     # Feed-forward network
-    ffn_out = jnp.dot(x, params['ffn_W1']) + params['ffn_b1']
-    ffn_out = jax.nn.relu(ffn_out)
-    ffn_out = jnp.dot(ffn_out, params['ffn_W2']) + params['ffn_b2']
+    ffn_out = x @ params['ffn_W1'] + params['ffn_b1']
+    ffn_out = F.relu(ffn_out)
+    ffn_out = ffn_out @ params['ffn_W2'] + params['ffn_b2']
     
     # Residual connection + layer norm
     x = x + ffn_out
@@ -95,29 +93,27 @@ def create_transformer_feature_extractor(d_model: int = 64,
     Output: (batch_size, d_model) shared features
     """
     
-    def init_fn(key: jnp.ndarray) -> Dict:
+    def init_fn(generator: torch.Generator | None) -> Dict:
         params = {}
+        dev = getattr(generator, "device", torch.device("cpu")) if generator is not None else torch.device("cpu")
         
         # Position embedding: (2,) -> (d_model,)
-        key, subkey = random.split(key)
-        params['pos_embed_W'] = random.normal(subkey, (2, d_model)) * 0.1
-        params['pos_embed_b'] = jnp.zeros(d_model)
+        params['pos_embed_W'] = torch.randn((2, d_model), generator=generator, device=dev) * 0.1
+        params['pos_embed_b'] = torch.zeros(d_model, device=dev)
         
         # Transformer blocks
         params['transformer_blocks'] = []
         for i in range(n_layers):
-            key, subkey = random.split(key)
-            block_params = init_transformer_block(subkey, d_model, n_heads)
+            block_params = init_transformer_block(generator, d_model, n_heads)
             params['transformer_blocks'].append(block_params)
         
         # Output projection
-        key, subkey = random.split(key)
-        params['output_W'] = random.normal(subkey, (d_model, d_model)) * 0.1
-        params['output_b'] = jnp.zeros(d_model)
+        params['output_W'] = torch.randn((d_model, d_model), generator=generator, device=dev) * 0.1
+        params['output_b'] = torch.zeros(d_model, device=dev)
         
         return params
     
-    def forward(params: Dict, particles: jnp.ndarray) -> jnp.ndarray:
+    def forward(params: Dict, particles: torch.Tensor) -> torch.Tensor:
         """
         Args:
             particles: (batch_size, 2)
@@ -126,7 +122,7 @@ def create_transformer_feature_extractor(d_model: int = 64,
             shared_features: (batch_size, d_model)
         """
         # Embed positions
-        h = jnp.dot(particles, params['pos_embed_W']) + params['pos_embed_b']
+        h = particles @ params['pos_embed_W'] + params['pos_embed_b']
         
         # Reshape to (batch_size, 1, d_model) for Transformer
         h = h.reshape(particles.shape[0], 1, -1)
@@ -136,10 +132,10 @@ def create_transformer_feature_extractor(d_model: int = 64,
             h = transformer_block_forward(block_params, h)
         
         # Pool: (batch_size, 1, d_model) -> (batch_size, d_model)
-        shared_features = jnp.mean(h, axis=1)
+        shared_features = torch.mean(h, dim=1)
         
         # Output projection
-        shared_features = jnp.dot(shared_features, params['output_W']) + params['output_b']
+        shared_features = shared_features @ params['output_W'] + params['output_b']
         
         return shared_features
     
@@ -153,24 +149,23 @@ def create_reward_head(d_shared: int = 64) -> Dict:
     Output: (batch_size,) reward values in [0, 1]
     """
     
-    def init_fn(key: jnp.ndarray) -> Dict:
+    def init_fn(generator: torch.Generator | None) -> Dict:
         params = {}
-        
-        key, *subkeys = random.split(key, 4)
+        dev = getattr(generator, "device", torch.device("cpu")) if generator is not None else torch.device("cpu")
         
         # 3-layer MLP
-        params['fc1_W'] = random.normal(subkeys[0], (d_shared, 32)) * 0.1
-        params['fc1_b'] = jnp.zeros(32)
+        params['fc1_W'] = torch.randn((d_shared, 32), generator=generator, device=dev) * 0.1
+        params['fc1_b'] = torch.zeros(32, device=dev)
         
-        params['fc2_W'] = random.normal(subkeys[1], (32, 16)) * 0.1
-        params['fc2_b'] = jnp.zeros(16)
+        params['fc2_W'] = torch.randn((32, 16), generator=generator, device=dev) * 0.1
+        params['fc2_b'] = torch.zeros(16, device=dev)
         
-        params['fc3_W'] = random.normal(subkeys[2], (16, 1)) * 0.1
-        params['fc3_b'] = jnp.zeros(1)
+        params['fc3_W'] = torch.randn((16, 1), generator=generator, device=dev) * 0.1
+        params['fc3_b'] = torch.zeros(1, device=dev)
         
         return params
     
-    def forward(params: Dict, shared_features: jnp.ndarray) -> jnp.ndarray:
+    def forward(params: Dict, shared_features: torch.Tensor) -> torch.Tensor:
         """
         Args:
             shared_features: (batch_size, d_shared)
@@ -178,14 +173,14 @@ def create_reward_head(d_shared: int = 64) -> Dict:
         Returns:
             reward: (batch_size,)
         """
-        h = jnp.dot(shared_features, params['fc1_W']) + params['fc1_b']
-        h = jax.nn.relu(h)
+        h = shared_features @ params['fc1_W'] + params['fc1_b']
+        h = F.relu(h)
         
-        h = jnp.dot(h, params['fc2_W']) + params['fc2_b']
-        h = jax.nn.relu(h)
+        h = h @ params['fc2_W'] + params['fc2_b']
+        h = F.relu(h)
         
-        reward = jnp.dot(h, params['fc3_W']) + params['fc3_b']
-        reward = jax.nn.sigmoid(reward).squeeze(-1)
+        reward = h @ params['fc3_W'] + params['fc3_b']
+        reward = torch.sigmoid(reward).squeeze(-1)
         
         return reward
     
@@ -204,26 +199,24 @@ def create_multi_user_reward_network(n_users: int,
     Output: (batch_size, n_users) rewards
     """
     
-    def init_fn(key: jnp.ndarray) -> Dict:
+    def init_fn(generator: torch.Generator | None) -> Dict:
         params = {}
         
         # Transformer feature extractor
-        key, subkey = random.split(key)
         feature_extractor = create_transformer_feature_extractor(
             d_model, n_heads, n_layers
         )
-        params['feature_extractor'] = feature_extractor['init'](subkey)
+        params['feature_extractor'] = feature_extractor['init'](generator)
         
         # One head per user
         params['heads'] = []
         for i in range(n_users):
-            key, subkey = random.split(key)
             head = create_reward_head(d_shared=d_model)
-            params['heads'].append(head['init'](subkey))
+            params['heads'].append(head['init'](generator))
         
         return params
     
-    def forward(params: Dict, particles: jnp.ndarray) -> jnp.ndarray:
+    def forward(params: Dict, particles: torch.Tensor) -> torch.Tensor:
         """
         Args:
             particles: (batch_size, 2)
@@ -247,55 +240,74 @@ def create_multi_user_reward_network(n_users: int,
             reward_i = head_network['forward'](params['heads'][i], shared_features)
             rewards_list.append(reward_i)
         
-        rewards = jnp.stack(rewards_list, axis=1)
+        rewards = torch.stack(rewards_list, dim=1)
         
         return rewards
     
     return {'init': init_fn, 'forward': forward}
 
 
+def _collect_param_tensors(params: Dict) -> List[torch.Tensor]:
+    tensors: List[torch.Tensor] = []
+    for v in params.values():
+        if isinstance(v, dict):
+            tensors.extend(_collect_param_tensors(v))
+        elif isinstance(v, list):
+            for item in v:
+                tensors.extend(_collect_param_tensors(item) if isinstance(item, dict) else ([item] if torch.is_tensor(item) else []))
+        else:
+            if torch.is_tensor(v):
+                tensors.append(v)
+    return tensors
+
+
 def train_multi_user_network(network: Dict, 
                              params: Dict, 
-                             optimizer: optax.GradientTransformation, 
-                             opt_state: optax.OptState,
-                             particles: jnp.ndarray, 
-                             true_rewards: jnp.ndarray) -> Tuple[Dict, optax.OptState, float]:
+                             optimizer: torch.optim.Optimizer, 
+                             opt_state,  # kept for API parity; unused
+                             particles: torch.Tensor, 
+                             true_rewards: torch.Tensor) -> Tuple[Dict, None, float]:
     """
     Train network on observed data
     
     Args:
         network: Network dictionary
         params: Network parameters
-        optimizer: Optax optimizer
-        opt_state: Optimizer state
+        optimizer: torch optimizer (expects params' tensors with requires_grad)
+        opt_state: unused (kept for compatibility)
         particles: (batch_size, 2) observed positions
         true_rewards: (batch_size, n_users) observed rewards
     
     Returns:
         new_params: Updated parameters
-        new_opt_state: Updated optimizer state
+        new_opt_state: None (optimizer holds state internally)
         loss: Training loss
     """
-    
-    def loss_fn(params: Dict) -> float:
-        pred_rewards = network['forward'](params, particles)
-        return jnp.mean((pred_rewards - true_rewards) ** 2)
-    
-    loss, grads = jax.value_and_grad(loss_fn)(params)
-    updates, new_opt_state = optimizer.update(grads, opt_state)
-    new_params = optax.apply_updates(params, updates)
-    
-    return new_params, new_opt_state, loss
+    # clear stale grads before new backward
+    for t in _collect_param_tensors(params):
+        if t.grad is not None:
+            t.grad = None
+
+    optimizer.zero_grad(set_to_none=True)
+    # ensure training data is not part of any autograd graph
+    particles = particles.detach()
+    true_rewards = true_rewards.detach()
+    pred_rewards = network['forward'](params, particles)
+    loss_tensor = torch.mean((pred_rewards - true_rewards) ** 2)
+    loss_tensor.backward()
+    optimizer.step()
+
+    return params, None, float(loss_tensor.item())
 
 
 def compute_single_user_gradient(network: Dict, 
                                  params: Dict, 
-                                 particle: jnp.ndarray, 
+                                 particle: torch.Tensor, 
                                  user_idx: int,
                                  n_users: int,
                                  d_model: int,
                                  n_heads: int,
-                                 n_layers: int) -> jnp.ndarray:
+                                 n_layers: int) -> torch.Tensor:
     """
     Compute gradient of reward w.r.t. position for a single particle and user
     Uses autodiff
@@ -314,7 +326,7 @@ def compute_single_user_gradient(network: Dict,
         gradient: (2,) gradient vector
     """
     
-    def single_reward(particle_input: jnp.ndarray) -> float:
+    def single_reward(particle_input: torch.Tensor) -> torch.Tensor:
         """Reward for single particle"""
         # Reshape to batch
         particle_batch = particle_input.reshape(1, 2)
@@ -333,10 +345,11 @@ def compute_single_user_gradient(network: Dict,
         
         return reward[0]
     
-    # Compute gradient using JAX autodiff
-    gradient = jax.grad(single_reward)(particle)
+    particle = particle.clone().detach().requires_grad_(True)
+    out = single_reward(particle)
+    grad = torch.autograd.grad(out, particle, retain_graph=False, create_graph=False)[0]
     
-    return gradient
+    return grad
 
 
 def create_reward_and_gradient_functions(network: Dict, 
@@ -365,7 +378,7 @@ def create_reward_and_gradient_functions(network: Dict,
     reward_fns = []
     for i in range(n_users):
         def make_reward_fn(user_idx: int) -> Callable:
-            def reward_fn(particles: jnp.ndarray) -> jnp.ndarray:
+            def reward_fn(particles: torch.Tensor) -> torch.Tensor:
                 """
                 Args:
                     particles: (n_particles, 2)
@@ -377,32 +390,45 @@ def create_reward_and_gradient_functions(network: Dict,
             return reward_fn
         reward_fns.append(make_reward_fn(i))
     
-    # Create gradient functions using autodiff
+    # Create gradient functions using autodiff (chunked to reduce memory)
     reward_grad_fns = []
     for i in range(n_users):
         def make_grad_fn(user_idx: int) -> Callable:
-            def grad_fn(particles: jnp.ndarray) -> jnp.ndarray:
+            def grad_fn(particles: torch.Tensor) -> torch.Tensor:
                 """
                 Args:
                     particles: (n_particles, 2)
                 Returns:
                     gradients: (n_particles, 2)
                 """
-                # Vectorized gradient computation
-                grad_fn_single = lambda p: compute_single_user_gradient(
-                    network, params, p, user_idx, n_users, d_model, n_heads, n_layers
+                # Compute gradients in chunks to avoid high peak memory from vmap/create_graph
+                n = particles.shape[0]
+                grads = torch.empty_like(particles)
+                chunk_size = 256
+                for start in range(0, n, chunk_size):
+                    end = min(start + chunk_size, n)
+                    x_chunk = particles[start:end].clone().detach().requires_grad_(True)
+                    # Forward for this user on the chunk
+                    feature_extractor = create_transformer_feature_extractor(
+                        d_model, n_heads, n_layers
+                    )
+                    shared_features = feature_extractor['forward'](
+                        params['feature_extractor'], x_chunk
+                    )
+                    head = create_reward_head(d_model)
+                    reward_chunk = head['forward'](params['heads'][user_idx], shared_features)
+                    # Sum to get scalar and take grad w.r.t. inputs
+                    out = reward_chunk.sum()
+                    grad_chunk = torch.autograd.grad(out, x_chunk, retain_graph=False, create_graph=False)[0]
+                    grads[start:end] = grad_chunk
+
+                grads = torch.clamp(grads, -10.0, 10.0)
+                grads = torch.where(
+                    torch.isnan(grads) | torch.isinf(grads),
+                    torch.zeros_like(grads),
+                    grads
                 )
-                gradients = jax.vmap(grad_fn_single)(particles)
-                
-                # Numerical stability
-                gradients = jnp.clip(gradients, -10.0, 10.0)
-                gradients = jnp.where(
-                    jnp.isnan(gradients) | jnp.isinf(gradients),
-                    0.0,
-                    gradients
-                )
-                
-                return gradients
+                return grads
             
             return grad_fn
         

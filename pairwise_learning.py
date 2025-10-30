@@ -4,11 +4,10 @@ Learn reward function r(x) from preference comparisons.
 Train on pairs: maximize r_winner - r_loser.
 """
 
-import jax
-import jax.numpy as jnp
-import jax.random as random
-import optax
+import torch
+import torch.nn.functional as F
 from typing import Tuple, Callable, Dict
+from torch.func import vmap, grad as func_grad
 
 
 def create_preference_cnn(input_dim: int = 2, hidden_channels: int = 16) -> Dict:
@@ -28,30 +27,29 @@ def create_preference_cnn(input_dim: int = 2, hidden_channels: int = 16) -> Dict
         Dictionary with 'init' and 'forward' functions
     """
     
-    def init_fn(key: jnp.ndarray) -> Dict:
+    def init_fn(generator: torch.Generator | None) -> Dict:
         params = {}
-        
-        key, *subkeys = random.split(key, 5)
+        dev = getattr(generator, "device", torch.device("cpu")) if generator is not None else torch.device("cpu")
         
         # Layer 1: (2,) -> (16,)
-        params['fc1_W'] = random.normal(subkeys[0], (input_dim, hidden_channels)) * 0.1
-        params['fc1_b'] = jnp.zeros(hidden_channels)
+        params['fc1_W'] = torch.randn((input_dim, hidden_channels), generator=generator, device=dev) * 0.1
+        params['fc1_b'] = torch.zeros(hidden_channels, device=dev)
         
         # Layer 2: (16,) -> (32,)
-        params['fc2_W'] = random.normal(subkeys[1], (hidden_channels, hidden_channels * 2)) * 0.1
-        params['fc2_b'] = jnp.zeros(hidden_channels * 2)
+        params['fc2_W'] = torch.randn((hidden_channels, hidden_channels * 2), generator=generator, device=dev) * 0.1
+        params['fc2_b'] = torch.zeros(hidden_channels * 2, device=dev)
         
         # Layer 3: (32,) -> (16,)
-        params['fc3_W'] = random.normal(subkeys[2], (hidden_channels * 2, hidden_channels)) * 0.1
-        params['fc3_b'] = jnp.zeros(hidden_channels)
+        params['fc3_W'] = torch.randn((hidden_channels * 2, hidden_channels), generator=generator, device=dev) * 0.1
+        params['fc3_b'] = torch.zeros(hidden_channels, device=dev)
         
         # Output: (16,) -> (1,)
-        params['out_W'] = random.normal(subkeys[3], (hidden_channels, 1)) * 0.1
-        params['out_b'] = jnp.zeros(1)
+        params['out_W'] = torch.randn((hidden_channels, 1), generator=generator, device=dev) * 0.1
+        params['out_b'] = torch.zeros(1, device=dev)
         
         return params
     
-    def forward(params: Dict, x: jnp.ndarray) -> jnp.ndarray:
+    def forward(params: Dict, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through network.
         
@@ -67,17 +65,17 @@ def create_preference_cnn(input_dim: int = 2, hidden_channels: int = 16) -> Dict
             x = x.reshape(1, -1)
         
         # Forward pass
-        h = jnp.dot(x, params['fc1_W']) + params['fc1_b']
-        h = jax.nn.relu(h)
+        h = x @ params['fc1_W'] + params['fc1_b']
+        h = F.relu(h)
         
-        h = jnp.dot(h, params['fc2_W']) + params['fc2_b']
-        h = jax.nn.relu(h)
+        h = h @ params['fc2_W'] + params['fc2_b']
+        h = F.relu(h)
         
-        h = jnp.dot(h, params['fc3_W']) + params['fc3_b']
-        h = jax.nn.relu(h)
+        h = h @ params['fc3_W'] + params['fc3_b']
+        h = F.relu(h)
         
-        rewards = jnp.dot(h, params['out_W']) + params['out_b']
-        rewards = jax.nn.sigmoid(rewards).squeeze(-1)  # [0, 1]
+        rewards = h @ params['out_W'] + params['out_b']
+        rewards = rewards.squeeze(-1)  # raw score (unbounded)
         
         if is_single:
             rewards = rewards.squeeze()
@@ -89,10 +87,10 @@ def create_preference_cnn(input_dim: int = 2, hidden_channels: int = 16) -> Dict
 
 def train_preference_network(network: Dict, 
                             params: Dict, 
-                            optimizer: optax.GradientTransformation, 
-                            opt_state: optax.OptState,
-                            winners: jnp.ndarray, 
-                            losers: jnp.ndarray) -> Tuple[Dict, optax.OptState, float]:
+                            optimizer: torch.optim.Optimizer, 
+                            opt_state,  # kept for API parity; unused
+                            winners: torch.Tensor, 
+                            losers: torch.Tensor) -> Tuple[Dict, None, float]:
     """
     Train network on pairwise preferences.
     Objective: maximize r_winner - r_loser.
@@ -114,31 +112,34 @@ def train_preference_network(network: Dict,
         loss: Training loss value
     """
     
-    def loss_fn(params: Dict) -> float:
-        r_win = network['forward'](params, winners)   # (k,)
-        r_loss = network['forward'](params, losers)   # (k,)
-        
-        # We want r_win > r_loss
-        # Margin between winner and loser rewards
-        margin = r_win - r_loss  # Should be positive
-        
-        # Log-sigmoid loss (Bradley-Terry model)
-        # P(winner > loser) = sigmoid(margin)
-        # Loss = -log P(winner > loser) = -log sigmoid(margin)
-        loss = -jnp.mean(jax.nn.log_sigmoid(margin * 10.0))  # Scale for stability
-        
-        return loss
-    
-    loss, grads = jax.value_and_grad(loss_fn)(params)
-    updates, new_opt_state = optimizer.update(grads, opt_state)
-    new_params = optax.apply_updates(params, updates)
-    
-    return new_params, new_opt_state, loss
+    for v in params.values():
+        if isinstance(v, dict):
+            for t in v.values():
+                if torch.is_tensor(t):
+                    t.requires_grad_(True)
+        elif torch.is_tensor(v):
+            v.requires_grad_(True)
+
+    # ensure inputs are not attached to any prior autograd graph
+    winners = winners.detach()
+    losers = losers.detach()
+    r_win = network['forward'](params, winners)
+    r_loss = network['forward'](params, losers)
+
+    # Bradley-Terry on raw scores: L = softplus(-(s_win - s_loss))
+    margin = r_win - r_loss
+    loss_tensor = torch.nn.functional.softplus(-margin).mean()
+
+    optimizer.zero_grad(set_to_none=True)
+    loss_tensor.backward()
+    optimizer.step()
+
+    return params, None, float(loss_tensor.item())
 
 
 def compute_reward_gradient(network: Dict, 
                            params: Dict, 
-                           particle: jnp.ndarray) -> jnp.ndarray:
+                           particle: torch.Tensor) -> torch.Tensor:
     """
     Compute gradient of learned reward w.r.t. particle position.
     Uses JAX autodiff for automatic differentiation.
@@ -153,10 +154,12 @@ def compute_reward_gradient(network: Dict,
     Returns:
         gradient: (2,) gradient of reward w.r.t. position
     """
-    def reward_fn(x: jnp.ndarray) -> float:
-        return network['forward'](params, x)
-    
-    return jax.grad(reward_fn)(particle)
+    particle = particle.clone().detach().requires_grad_(True)
+    out = network['forward'](params, particle)
+    if out.ndim > 0:
+        out = out.sum()
+    grad = torch.autograd.grad(out, particle, retain_graph=False, create_graph=False)[0]
+    return grad
 
 
 def create_reward_and_gradient_functions(network: Dict, 
@@ -173,7 +176,7 @@ def create_reward_and_gradient_functions(network: Dict,
         reward_grad_fn: Function that takes (n_particles, 2) and returns (n_particles, 2)
     """
     
-    def reward_fn(particles: jnp.ndarray) -> jnp.ndarray:
+    def reward_fn(particles: torch.Tensor) -> torch.Tensor:
         """
         Args:
             particles: (n_particles, 2)
@@ -182,22 +185,24 @@ def create_reward_and_gradient_functions(network: Dict,
         """
         return network['forward'](params, particles)
     
-    def reward_grad_fn(particles: jnp.ndarray) -> jnp.ndarray:
+    def reward_grad_fn(particles: torch.Tensor) -> torch.Tensor:
         """
         Args:
             particles: (n_particles, 2)
         Returns:
             gradients: (n_particles, 2)
         """
-        # Vectorized gradient computation
-        grad_fn_single = lambda p: compute_reward_gradient(network, params, p)
-        gradients = jax.vmap(grad_fn_single)(particles)
-        
-        # Numerical stability
-        gradients = jnp.clip(gradients, -10.0, 10.0)
-        gradients = jnp.where(
-            jnp.isnan(gradients) | jnp.isinf(gradients),
-            0.0,
+        # vectorized gradient via torch.func
+        def single_reward(p_single: torch.Tensor) -> torch.Tensor:
+            out = network['forward'](params, p_single)
+            return out.sum() if out.ndim > 0 else out
+
+        grad_single = func_grad(single_reward)
+        gradients = vmap(grad_single)(particles)
+        gradients = torch.clamp(gradients, -10.0, 10.0)
+        gradients = torch.where(
+            torch.isnan(gradients) | torch.isinf(gradients),
+            torch.zeros_like(gradients),
             gradients
         )
         
