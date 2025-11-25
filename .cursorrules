@@ -1,2 +1,0 @@
-Only use try/except blocks, fallbacks, or automatic device checks when explicitly instructed by the user. Prefer minimal, core functionality without defensive programming, debugging prints, or implicit fallbacks.
-
