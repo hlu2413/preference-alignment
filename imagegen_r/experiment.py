@@ -7,10 +7,10 @@ import torchvision.utils as vutils
 from torchvision.transforms import ToPILImage
 from typing import Dict, Tuple, Optional, List
 
-from imagegen.sd15_pipeline import SD15LatentModel
-from imagegen.openclip_proxy import OpenCLIPPreferenceProxy
-from imagegen.surrogate import create_surrogate_and_grad
-from imagegen.fkc import run_fkc_simulation_image, gamma_schedule, beta_schedule
+from imagegen_r.sd15_pipeline import SD15LatentModel
+from imagegen_r.openclip_proxy import OpenCLIPPreferenceProxy
+from imagegen_r.surrogate import create_surrogate_and_grad
+from imagegen_r.fkc import run_fkc_simulation_image, gamma_schedule, beta_schedule
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,8 +36,8 @@ def run_experiment(
     device: Optional[torch.device] = None,
     temperature: float = 10.0,
     fruit_users: Optional[Dict[str, List[str]]] = None,
-    prompt_for_seed: str = "a photo of a fruit",
-    output_root: str = "imagegen/results",
+    prompt_for_seed: str = "a photo of food",
+    output_root: str = "imagegen_r/results",
     seed: Optional[int] = None
 ) -> Dict:
     if device is None:
@@ -49,7 +49,7 @@ def run_experiment(
     torch.manual_seed(seed)
     if device.type == 'cuda':
         torch.cuda.manual_seed_all(seed)
-
+    
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
 
@@ -61,9 +61,7 @@ def run_experiment(
     clip_proxy = OpenCLIPPreferenceProxy(device=device)
     if fruit_users is None:
         fruit_users = {
-            'user_apple': ["a photo of an apple"],
-            'user_grape': ["a photo of grapes"],
-            'user_banana': ["a photo of a banana"],
+            'user_fruit': ["a photo of a fruit", "a photo of fruits", "fruit", "fruits"],
         }
     user_prompt_bank = clip_proxy.build_user_prompt_bank(fruit_users)
 
@@ -119,26 +117,24 @@ def run_experiment(
     step_count += 1
     total_steps = B // k_observe
     diversity_enabled = True
+    fkc_steps = 5
 
     while B > 0:
-        current_gamma = gamma_schedule(step_count - 1, total_steps, gamma_max=0.05, gamma_min=0.0)
-        current_beta = beta_schedule(step_count - 1, total_steps, beta_min=0.5, beta_max=2.0)
+        remaining_steps = total_steps - (step_count - 1)
+        use_fkc = remaining_steps <= fkc_steps
+        
+        step_dir = os.path.join(run_dir, f"step_{step_count + 1:03d}")
+        os.makedirs(step_dir, exist_ok=True)
+        
+        if use_fkc:
+            fkc_step_idx = fkc_steps - remaining_steps
+            current_gamma = gamma_schedule(fkc_step_idx, fkc_steps, gamma_max=0.05, gamma_min=0.0)
+            current_beta = beta_schedule(fkc_step_idx, fkc_steps, beta_min=0.5, beta_max=2.0)
+        hist_latents_gpu = torch.cat([lat.to(device) for lat in historical_latents], dim=0)
 
         sub_gen = _sub_generator(generator)
-        # Sample from prior distribution (prompt-conditioned), not pure noise
-        # This is the prior we're updating using reward tilting via FKC
-        # Process in smaller batches to save GPU memory
-        z_clean = sd.generate_latents_from_prompt(prompt_for_seed, batch_size=n_particles, generator=sub_gen, batch_processing=8)
-        # Add noise to match initial timestep for FKC (FKC expects to start from noisy latents)
-        # FKC will then denoise with reward/diversity guidance
-        init_sigma = sd.pipe.scheduler.init_noise_sigma
-        noise = torch.randn(z_clean.shape, generator=sub_gen, device=z_clean.device, dtype=z_clean.dtype) * init_sigma
-        z = z_clean + noise
-        del z_clean, noise
+        z = sd.sample_latents((n_particles,) + latent_shape, sub_gen)
         w = torch.zeros(n_particles, device=device)
-        
-        # Only move historical latents to GPU when needed in FKC
-        hist_latents_gpu = torch.cat([lat.to(device) for lat in historical_latents], dim=0) if historical_latents else None
 
         def grad_fn(z_batch: torch.Tensor) -> torch.Tensor:
             z_batch = z_batch.clone().requires_grad_(True)
@@ -155,33 +151,31 @@ def run_experiment(
             n_steps=n_steps, sd_model=sd, generator=sub_gen, score_fn=score_fn,
             historical_particles=hist_latents_gpu, diversity_enabled=diversity_enabled
         )
-        if hist_latents_gpu is not None:
         del hist_latents_gpu
-        torch.cuda.empty_cache()
 
         gamma_history.append(current_gamma)
         beta_history.append(current_beta)
 
         sorted_idx = torch.argsort(w)
         observe_idx = sorted_idx[-k_observe:]
-        selected_z = z[observe_idx].detach()
-        selected_z_cpu = selected_z.cpu()
-        
-        step_dir = os.path.join(run_dir, f"step_{step_count + 1:03d}")
-        os.makedirs(step_dir, exist_ok=True)
-        visualize_weight_distribution(w.cpu(), step_dir, step_count + 1, k_observe)
+        selected_z = z[observe_idx]
+            
+            visualize_weight_distribution(w, step_dir, step_count + 1, k_observe)
+        else:
+            sub_gen = _sub_generator(generator)
+            selected_z = sd.generate_latents_from_prompt(prompt_for_seed, batch_size=k_observe, generator=sub_gen)
+            gamma_history.append(0.0)
+            beta_history.append(0.0)
 
         with torch.no_grad():
             selected_images = sd.decode_latents(selected_z).cpu()
-        del selected_z
         user_scores = clip_proxy.score_images(selected_images, user_prompt_bank, temperature)
-        union_scores = torch.stack(list(user_scores.values()), dim=1).max(dim=1).values.cpu()
+        union_scores = torch.stack(list(user_scores.values()), dim=1).max(dim=1).values
 
-        historical_latents.append(selected_z_cpu)
+        historical_latents.append(selected_z.detach().cpu())
         historical_scores.append(union_scores.detach().cpu())
-        del union_scores
+        del selected_z
 
-        # Move to GPU only for training, in batches if needed
         all_hist_z = torch.cat([lat.to(device) for lat in historical_latents], dim=0)
         all_hist_scores = torch.cat(historical_scores, dim=0).to(device)
 
@@ -191,22 +185,29 @@ def run_experiment(
             loss = torch.mean((preds - all_hist_scores) ** 2)
             loss.backward()
             optimizer.step()
-        del all_hist_z, all_hist_scores
-        torch.cuda.empty_cache()
+        del all_hist_z
+        del all_hist_scores
 
-        success_rates.append(float((historical_scores[-1] > 0.7).float().mean().item()))
+        success_rates.append(float((union_scores > 0.7).float().mean().item()))
+        del union_scores
 
-        # Save per-step images (already on CPU)
+        # Save per-step images
         for i, img in enumerate(selected_images):
-            to_pil(img).save(os.path.join(step_dir, f"selected_{i:03d}.png"))
-        del selected_images
-        # Also save a grid of all candidates
+            to_pil(img.cpu()).save(os.path.join(step_dir, f"selected_{i:03d}.png"))
+        
+        # Save grid - for FKC steps, show all candidates; for base model steps, show selected only
+        if use_fkc:
         with torch.no_grad():
             all_images = sd.decode_latents(z).cpu()
         grid = vutils.make_grid(all_images, nrow=min(8, all_images.shape[0]))
         vutils.save_image(grid, os.path.join(step_dir, "grid.png"))
-        del all_images, z
-        torch.cuda.empty_cache()
+        del all_images
+        del z
+        else:
+            grid = vutils.make_grid(selected_images, nrow=min(8, selected_images.shape[0]))
+            vutils.save_image(grid, os.path.join(step_dir, "grid.png"))
+        
+        del selected_images
 
         B -= k_observe
         step_count += 1
@@ -232,7 +233,7 @@ if __name__ == "__main__":
         latent_shape=(4, 64, 64),
         device=device,
         temperature=10.0,
-        prompt_for_seed="a photo of one single fruit",
+        prompt_for_seed="a photo of food",
         seed=None
     )
 

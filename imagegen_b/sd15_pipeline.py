@@ -14,17 +14,12 @@ class SD15LatentModel:
         self.device = device
         self.pipe = StableDiffusionPipeline.from_pretrained(
             model_id,
-            torch_dtype=torch.float16 if device.type == 'cuda' else torch.float32
+            dtype=torch.float16 if device.type == 'cuda' else torch.float32
         )
         self.pipe = self.pipe.to(device)
         self.unet_dtype = next(self.pipe.unet.parameters()).dtype
         self.pipe.safety_checker = None
         self.pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(self.pipe.scheduler.config)
-        # Enable memory-efficient settings
-        if device.type == 'cuda':
-            self.pipe.enable_attention_slicing()
-            self.pipe.enable_vae_slicing()
-            self.pipe.enable_vae_tiling()  # Additional VAE memory optimization
         # set a default schedule and cache timesteps/sigmas for score queries
         self.num_inference_steps = int(num_inference_steps)
         self.pipe.scheduler.set_timesteps(self.num_inference_steps, device=self.device)
@@ -40,24 +35,17 @@ class SD15LatentModel:
         vae_dtype = next(self.pipe.vae.parameters()).dtype
         images = images.to(device=self.device, dtype=vae_dtype)
         images = (images * 2.0) - 1.0
-        with torch.no_grad():
-            posterior = self.pipe.vae.encode(images).latent_dist
-            latents = posterior.sample() * VAE_SCALE_FACTOR
-        del images
-        torch.cuda.empty_cache()
+        posterior = self.pipe.vae.encode(images).latent_dist
+        latents = posterior.sample() * VAE_SCALE_FACTOR
         return latents
 
     def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
         vae_dtype = next(self.pipe.vae.parameters()).dtype
         latents = latents.to(device=self.device, dtype=vae_dtype)
-        with torch.no_grad():
-            images = self.pipe.vae.decode(latents / VAE_SCALE_FACTOR).sample
-            images = (images + 1.0) / 2.0
-            images = torch.nan_to_num(images, nan=0.0, posinf=1.0, neginf=0.0)
-            images = torch.clamp(images, 0.0, 1.0)
-        del latents
-        torch.cuda.empty_cache()
-        return images
+        images = self.pipe.vae.decode(latents / VAE_SCALE_FACTOR).sample
+        images = (images + 1.0) / 2.0
+        images = torch.nan_to_num(images, nan=0.0, posinf=1.0, neginf=0.0)
+        return torch.clamp(images, 0.0, 1.0)
 
     # --- New: prompt helpers and UNet-based score ---
     def _encode_prompt(self, prompt: str) -> torch.Tensor:
@@ -106,24 +94,16 @@ class SD15LatentModel:
             return self._score_unet(z, t, prompt_embeds)
         return score_fn
 
-    def generate_latents_from_prompt(self, prompt: str, batch_size: int, generator: torch.Generator | None = None, num_inference_steps: int | None = None, batch_processing: int = 8) -> torch.Tensor:
+    def generate_latents_from_prompt(self, prompt: str, batch_size: int, generator: torch.Generator | None = None, num_inference_steps: int | None = None) -> torch.Tensor:
         steps = int(num_inference_steps) if num_inference_steps is not None else self.num_inference_steps
-        # Process in smaller batches to save memory
-        all_latents = []
-        for i in range(0, batch_size, batch_processing):
-            batch_end = min(i + batch_processing, batch_size)
-            batch_size_curr = batch_end - i
-            prompts: List[str] = [prompt] * batch_size_curr
-            with torch.no_grad():
-                result = self.pipe(prompts, num_inference_steps=steps, generator=generator)
-                pil_images = result.images
-            to_tensor = T.ToTensor()
-            images = torch.stack([to_tensor(img) for img in pil_images]).to(self.device)
-            # encode back to SD15 latent space for downstream optimization
-            latents = self.encode_images_to_latents(images)
-            all_latents.append(latents.cpu())
-            del images, latents, pil_images, result
-            torch.cuda.empty_cache()
-        return torch.cat(all_latents, dim=0).to(self.device)
+        prompts: List[str] = [prompt] * batch_size
+        with torch.no_grad():
+            result = self.pipe(prompts, num_inference_steps=steps, generator=generator)
+            pil_images = result.images
+        to_tensor = T.ToTensor()
+        images = torch.stack([to_tensor(img) for img in pil_images]).to(self.device)
+        # encode back to SD15 latent space for downstream optimization
+        latents = self.encode_images_to_latents(images)
+        return latents
 
 

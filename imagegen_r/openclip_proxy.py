@@ -39,8 +39,6 @@ class OpenCLIPPreferenceProxy:
             probs = torch.softmax(temperature * sims, dim=1)
             score = probs.max(dim=1).values
             scores[user] = score
-        del processed, image_features
-        torch.cuda.empty_cache()
         return scores
 
 
